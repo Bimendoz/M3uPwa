@@ -61,7 +61,8 @@ syncViewport();
 const S = {
   lists: store.get("m3u.lists", null),
   active: store.get("m3u.active", ""),
-  settings: { format: "iptv", ghToken: "", ...store.get("m3u.settings", {}) },
+  settings: { format: "iptv", ghToken: "", cartvOnly: true, stopFirst: true, ...store.get("m3u.settings", {}) },
+  showAll: false, // mostrar también lo que no pasó (o no se pudo confirmar) la prueba como CarTV
   view: "vSearch", listCat: "*",
   search: null // { query, running, step, tried, failed:[], found:[] }
 };
@@ -180,26 +181,35 @@ async function ghApi(path, init = {}) {
   if (!r.ok) throw new Error(r.status === 401 ? "El token de GitHub no es válido o venció" : r.status === 403 ? "GitHub rechazó el pedido (permiso «gist» o límite de uso)" : `GitHub respondió ${r.status}`);
   return r.json();
 }
-async function relayGistId() {
-  if (S.settings.relayGistId) return S.settings.relayGistId;
+async function findRelayGist() {
+  const hits = [];
   for (let page = 1; page <= 3; page++) {
     const list = await ghApi(`/gists?per_page=100&page=${page}`);
-    const hit = list.find((g) => g.description === RELAY_DESC);
-    if (hit) { S.settings.relayGistId = hit.id; save({ republish: false }); return hit.id; }
+    hits.push(...list.filter((g) => g.description === RELAY_DESC));
     if (list.length < 100) break;
   }
-  const g = await ghApi("/gists", { method: "POST", body: JSON.stringify({ description: RELAY_DESC, public: false,
-    files: { "LEEME.md": { content: "Puente entre la extensión HLS Stream Detector y la app Listas M3U del iPhone. No lo borres." } } }) });
-  S.settings.relayGistId = g.id; save({ republish: false });
-  return g.id;
+  hits.sort((x, y) => String(x.created_at || "").localeCompare(String(y.created_at || "")) || String(x.id).localeCompare(String(y.id)));
+  return hits[0]?.id || "";
+}
+// Si hubiera más de un Gist del puente, los dos lados eligen el más antiguo (se revisa cada 10 min)
+async function relayGistId() {
+  if (S.settings.relayGistId && Date.now() - (S.settings.relayGistAt || 0) < 10 * 60e3) return S.settings.relayGistId;
+  let id = await findRelayGist();
+  if (!id) {
+    await ghApi("/gists", { method: "POST", body: JSON.stringify({ description: RELAY_DESC, public: false,
+      files: { "LEEME.md": { content: "Puente entre la extensión HLS Stream Detector y la app Listas M3U del iPhone. No lo borres." } } }) });
+    id = await findRelayGist();
+  }
+  S.settings.relayGistId = id; S.settings.relayGistAt = Date.now(); save({ republish: false });
+  return id;
 }
 // Encarga a la extensión una búsqueda ({query}) o una extracción ({pageUrl}) y espera la respuesta.
-async function relayJob(payload, job, my) {
+async function relayJob(payload, job, my, raw = false) {
   job.step = "Enviando el encargo a tu computador…"; job.viaPc = true; renderSearch();
   let id = await relayGistId();
   const rid = uid();
   try { await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: { content: JSON.stringify({ ...payload, at: Date.now() }) } } }) }); }
-  catch (e) { if (!/404/.test(e.message)) throw e; S.settings.relayGistId = ""; id = await relayGistId(); await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: { content: JSON.stringify({ ...payload, at: Date.now() }) } } }) }); }
+  catch (e) { if (!/404/.test(e.message)) throw e; S.settings.relayGistId = ""; S.settings.relayGistAt = 0; id = await relayGistId(); await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: { content: JSON.stringify({ ...payload, at: Date.now() }) } } }) }); }
   job.step = "Esperando a tu computador (revisa cada 30 s)…"; renderSearch();
   const t0 = Date.now();
   let acked = false;
@@ -218,7 +228,7 @@ async function relayJob(payload, job, my) {
         if (res.status === "done") {
           ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`res-${rid}.json`]: null } }) }).catch(() => {});
           for (const x of res.failed || []) job.failed.push({ host: x.host, why: "(computador) " + x.why });
-          return res.found || [];
+          return raw ? res : res.found || [];
         }
       }
     }
@@ -234,7 +244,7 @@ async function relayJob(payload, job, my) {
 async function addPcResults(found, job, my) {
   for (const f of found) {
     if (my !== searchToken || job.found.some((x) => x.key === keyOf(f.url))) continue;
-    const item = { tier: f.tier || sourceInfo(f.url, { pageUrl: f.pageUrl }).tier, tierWhy: f.tierWhy || [], url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
+    const item = { car: f.car, tier: f.tier || sourceInfo(f.url, { pageUrl: f.pageUrl }).tier, tierWhy: f.tierWhy || [], url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
       live: f.live, res: f.res ? String(f.res).split("x").pop() + "p" : "", verifiedAt: f.verifiedAt || Date.now(), lock: networkLock(f.url), exp: tokenExpiry(f.url), viaPc: true };
     if (f.needs === "referer") item.note = "Probado por tu computador (necesita Referer: Safari no puede probarlo)";
     else {
@@ -294,7 +304,9 @@ const tierOf = (item) => (item.tier ? { tier: item.tier, why: item.tierWhy || []
 // para que el otro lado no lo vuelva a agregar. «base» es lo último que este equipo sincronizó: comparando
 // contra ella se sabe qué cambió aquí sin tener que marcar cada edición a mano.
 const SYNC_FILE = "canales-sync.json";
-const SHARED_FIELDS = ["key", "url", "kind", "referer", "name", "group", "thumb", "live", "tvgId", "tier", "tierWhy", "pageUrl", "useChannel", "channelLive", "ytId", "author"];
+const SHARED_FIELDS = ["key", "url", "kind", "referer", "name", "group", "thumb", "live", "tvgId", "tier", "tierWhy", "pageUrl", "useChannel", "channelLive", "ytId", "author", "car"];
+// car = { ok, verdict, why, at }: última prueba «como CarTV» hecha por el computador (ok/referer = apto)
+const carFrom = (verdict, why = "") => ({ ok: verdict === "ok" || verdict === "referer", verdict, why, at: Date.now() });
 function shareOf(it) {
   const o = {};
   for (const f of SHARED_FIELDS) if (it[f] !== undefined && it[f] !== null && it[f] !== "") o[f] = it[f];
@@ -462,6 +474,24 @@ async function candidates(query) {
 
 // ---------- prueba real: reproducir en un <video> oculto ----------
 // Safari reproduce HLS igual que las apps del iPhone. Solo cuenta como "funciona" si el video AVANZA de verdad.
+// Safari da el mismo error para cosas distintas: se revisa la lista para decir el motivo real
+async function diagnose(url, referer = "") {
+  if (referer) return "este canal exige Referer y Safari no puede mandarlo; en CarTV (formato «Apps IPTV») sí puede funcionar";
+  const exp = tokenExpiry(url);
+  if (exp && exp < Date.now()) return "el token del link ya venció: hay que renovarlo desde su página";
+  let r;
+  try { r = await fetchT(url, 8000); }
+  catch (e) { return e.name === "AbortError" ? "el servidor no respondió a tiempo (caído o bloquea tu red)" : "el servidor no deja revisarlo desde la web; puede que en CarTV sí funcione. Usa «Diagnosticar con mi computador»"; }
+  if (r.status === 403 || r.status === 401) return `el servidor lo bloquea (${r.status}): exige Referer, sesión, o no acepta tu red o país`;
+  if (r.status === 404 || r.status === 410) return `el link ya no existe (${r.status}): el canal cambió de dirección`;
+  if (!r.ok) return `el servidor respondió ${r.status}`;
+  const text = await r.text().catch(() => "");
+  if (!text.trimStart().startsWith("#EXTM3U")) return "el link no devuelve una lista de video (puede ser una página o un error)";
+  if (/KEYFORMAT="?(com\.widevine|com\.microsoft|com\.apple\.streamingkeydelivery)|METHOD=SAMPLE-AES/i.test(text)) return "el video tiene DRM (protección): solo se ve en la app o página oficial";
+  if (/CODECS="[^"]*(hvc1|hev1)/i.test(text)) return "el video es H.265/HEVC: este equipo o la app puede no soportarlo";
+  if (/CODECS="[^"]*av01/i.test(text)) return "el video es AV1: muchos equipos no lo soportan";
+  return "la lista responde pero el video no arranca aquí; prueba «Diagnosticar con mi computador»";
+}
 function mediaError(v) {
   const c = v.error?.code;
   return c === 2 ? "error de red: el servidor no entrega el video"
@@ -492,7 +522,7 @@ function verifyVideo(url, ms = 16000) {
         finish(null, { w: v.videoWidth, h: v.videoHeight, live, audioOnly: !v.videoWidth });
       }
     });
-    v.addEventListener("error", () => finish(new Error(mediaError(v))));
+    v.addEventListener("error", () => { const code = v.error?.code; diagnose(url).then((m) => finish(new Error(code === 3 ? mediaError(v) : m)), () => finish(new Error(mediaError(v)))); });
     if (NATIVE_HLS) v.src = url;
     else if (window.Hls?.isSupported()) {
       hls = new Hls({ enableWorker: true, maxBufferLength: 6 });
@@ -511,7 +541,10 @@ function verifyVideo(url, ms = 16000) {
 }
 
 // ---------- búsqueda ----------
-const MAX_FOUND = 10, MAX_TESTS = 20; // se prueban todos y se muestran los que funcionan
+const MAX_FOUND = Infinity, MAX_TESTS = Infinity; // sin límite: se prueban todos y tú eliges cuáles agregar
+// Orden estricto: un link a la vez, en el orden de la búsqueda; con «parar en el primero» termina apenas uno funciona
+const stopFirstOn = () => S.settings.stopFirst !== false;
+const searchDone = (job) => job.found.length >= MAX_FOUND || (stopFirstOn() && job.found.length > 0);
 let searchToken = 0;
 async function runSearch(query) {
   query = cleanTitle(query);
@@ -527,10 +560,10 @@ async function runSearch(query) {
     job.step = `Probando ${list.length} link(s): los reproduzco uno por uno…`;
     renderSearch();
     const seen = new Set();
-    const conc = IS_IOS ? 1 : 2; // el iPhone reproduce un video a la vez
+    const conc = 1; // de a uno, en el orden de la búsqueda
     const q = [...list];
     await Promise.all(Array.from({ length: conc }, async () => {
-      while (q.length && my === searchToken && job.found.length < MAX_FOUND) {
+      while (q.length && my === searchToken && !searchDone(job)) {
         const c = q.shift();
         const k = keyOf(c.url);
         if (seen.has(k)) continue;
@@ -549,13 +582,41 @@ async function runSearch(query) {
       }
     }));
     if (my !== searchToken) return;
-    job.found.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3));
     job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : `Probé ${job.tried} link(s) y ninguno funcionó.`;
+    await confirmCarTV(job, my);
   } catch (e) {
     if (my !== searchToken) return;
     job.step = job.viaPc ? e.message : "No se pudo leer el directorio de canales. Revisa tu conexión e intenta de nuevo.";
   } finally {
     if (my === searchToken) { job.running = false; renderSearch(); }
+  }
+}
+// Pide al computador la prueba «como CarTV» de todo lo encontrado (también lo que Safari no pudo probar).
+// Sin computador disponible, los resultados quedan marcados «probado solo en el iPhone».
+async function confirmCarTV(job, my) {
+  const pool = [...job.found, ...(job.untested || [])].filter((f) => !f.car);
+  if (!pool.length) return;
+  if (!S.settings.ghToken) { job.pcState = "none"; return; }
+  job.pcState = "confirming"; renderSearch();
+  const done = job.step;
+  try {
+    const res = await relayJob({ checkUrls: pool.map((f) => ({ url: f.url, referer: f.referer || "" })) }, job, my, true);
+    if (my !== searchToken) return;
+    for (const c of res?.checks || []) {
+      const f = pool.find((x) => x.url === c.url);
+      if (!f) continue;
+      f.car = carFrom(c.verdict, c.why);
+      if (f.car.ok && job.untested?.includes(f)) { job.untested = job.untested.filter((x) => x !== f); job.found.push(f); }
+    }
+    job.pcState = "done";
+    const ok = job.found.filter((f) => f.car?.ok).length;
+    job.step = `${ok} apto(s) para CarTV · confirmado por tu computador.`;
+  } catch {
+    job.pcState = "off";
+    job.step = done + " Tu computador no respondió: probados solo en el iPhone.";
+  } finally {
+    job.viaPc = false;
+    // se deja el orden de la búsqueda
   }
 }
 async function runPage(pageUrl) {
@@ -570,7 +631,7 @@ async function runPage(pageUrl) {
       const urls = findM3u8(page.text, page.url).slice(0, 6);
       const title = cleanTitle(((page.text.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || "").replace(/&amp;/g, "&")) || hostOf(pageUrl);
       for (const u of urls) {
-        if (my !== searchToken || job.found.length >= MAX_FOUND) break;
+        if (my !== searchToken || searchDone(job)) break;
         job.tried++; job.step = `Probando ${hostOf(u)}…`; renderSearch();
         try { const r = await verifyVideo(u); const si = sourceInfo(u, { pageUrl }); job.found.push({ tier: si.tier, tierWhy: si.why, url: u, name: title, key: keyOf(u), live: r.live, res: r.h ? r.h + "p" : "", verifiedAt: Date.now(), lock: networkLock(u), exp: tokenExpiry(u), referer: "" }); }
         catch (e) { job.failed.push({ host: hostOf(u), why: e.message }); }
@@ -579,10 +640,12 @@ async function runPage(pageUrl) {
     // 2) con el computador: abre la página en Chrome, le da play y captura lo que pide el reproductor
     if (!job.found.length && my === searchToken) {
       if (!S.settings.ghToken) { job.step = "Aquí no encontré el video. Para sacarlo con tu computador, conecta en Ajustes el mismo GitHub de la extensión."; return; }
-      await addPcResults(await relayJob({ pageUrl }, job, my), job, my);
+      await addPcResults(await relayJob({ pageUrl, stopFirst: stopFirstOn() }, job, my), job, my);
     }
     if (my !== searchToken) return;
-    job.step = job.found.length ? `${job.found.length} link(s) encontrado(s).` : job.viaPc ? job.step.replace(/^Tu computador: /, "Tu computador: ") : "No encontré ningún video en esa página.";
+    if (job.found.some((f) => !f.car)) await confirmCarTV(job, my);
+    if (my !== searchToken) return;
+    job.step = job.pcState === "done" ? job.step : job.found.length ? `${job.found.length} link(s) encontrado(s).` : job.viaPc ? job.step.replace(/^Tu computador: /, "Tu computador: ") : "No encontré ningún video en esa página.";
   } catch (e) {
     if (my === searchToken) job.step = e.message;
   } finally {
@@ -592,7 +655,7 @@ async function runPage(pageUrl) {
 async function runPcSearch(query) {
   const my = ++searchToken;
   const job = S.search = { query, running: true, step: "", tried: 0, failed: [], found: [], sites: [], viaPc: true };
-  try { await addPcResults(await relayJob({ query }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
+  try { await addPcResults(await relayJob({ query, stopFirst: stopFirstOn() }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
   catch (e) { if (my === searchToken) job.step = e.message; }
   finally { if (my === searchToken) { job.running = false; renderSearch(); } }
 }
@@ -638,13 +701,24 @@ function renderSearch() {
       el("button", { class: "btn", style: "width:100%", onclick: () => (S.settings.ghToken ? runPcSearch(j.query) : (toast("Conecta GitHub en Ajustes"), setView("vSettings"))) }, icon("laptop"), "Buscar con mi computador"));
     for (const s of j.sites) out.append(el("a", { class: "btn sm", href: s, target: "_blank", rel: "noopener", style: "display:inline-block;margin:4px 6px 0 0;text-decoration:none" }, "Abrir " + hostOf(s)));
   }
-  for (const f of j.found) {
+  // Solo aptos para CarTV: si el computador confirmó, se muestran solo los que pasaron; lo demás queda a un toque
+  const strict = S.settings.cartvOnly && !S.showAll && j.pcState === "done";
+  const shown = strict ? j.found.filter((f) => f.car?.ok) : j.found;
+  const hidden = j.found.length - shown.length + (S.settings.cartvOnly && !S.showAll ? (j.untested?.length || 0) : 0);
+  if (j.pcState === "confirming") out.append(el("p", { class: "hint" }, el("span", { class: "spin" }), "Confirmando con tu computador cuáles funcionan en CarTV…"));
+  if (j.pcState === "off" || j.pcState === "none") out.append(el("p", { class: "hint warn" }, icon("alert", 13), j.pcState === "none"
+    ? " Probados solo en el iPhone. Conecta GitHub en Ajustes para que tu computador confirme cuáles sirven en CarTV."
+    : " Tu computador no respondió: estos resultados están probados solo en el iPhone."));
+  if (hidden > 0 && !j.running) out.append(el("button", { class: "btn sm", style: "margin:4px 0 6px", onclick: () => { S.showAll = true; renderSearch(); } }, icon("filter", 14), `Mostrar ${hidden} que no pasaron la prueba de CarTV`));
+  if (S.showAll && S.settings.cartvOnly) out.append(el("button", { class: "btn sm", style: "margin:4px 0 6px", onclick: () => { S.showAll = false; renderSearch(); } }, icon("filter", 14), "Ver solo aptos para CarTV"));
+  for (const f of shown) {
     const ti = tierOf(f);
-    const info = [f.warn ? "Verificado solo en tu computador" : "Verificado", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
+    const info = [f.car ? (f.car.ok ? "Apto CarTV" : "No apto CarTV") : f.warn ? "Verificado solo en tu computador" : j.pcState === "confirming" ? "Confirmando CarTV…" : "Probado en el iPhone", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
     const weak = needsPlayerSession(f.url);
     const notes = [f.note || "", weak ? "Link sin la sesión del reproductor: puede fallar en CarTV. Mejor sácalo de la página oficial." : "", f.lock ? `Solo funciona en la red donde lo probaste (${f.lock === "ip" ? "tu IP" : "tu proveedor"})` : "", f.exp ? `Vence ${new Date(f.exp).toLocaleString()}` : ""].filter(Boolean);
     out.append(el("div", { class: "card " + (f.warn || weak ? "st-warn" : "st-ok") },
-      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("span", { class: "tier t-" + ti.tier, title: ti.why.join(" · ") }, TIER_LABEL[ti.tier]), el("b", {}, f.name), el("div", { class: "meta tag " + (f.warn ? "warn" : "ok") }, icon(f.warn ? "alert" : "check", 12), info), notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
+      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("span", { class: "tier t-" + ti.tier, title: ti.why.join(" · ") }, TIER_LABEL[ti.tier]), el("b", {}, f.name), el("div", { class: "meta tag " + (f.car ? (f.car.ok ? "ok" : "bad") : f.warn ? "warn" : "muted") }, icon(f.car ? (f.car.ok ? "cast" : "x") : f.warn ? "alert" : "check", 12), info),
+          f.car && !f.car.ok ? el("div", { class: "meta bad" }, f.car.why || "no pasó la prueba como CarTV") : null, notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
       el("div", { class: "meta", style: "margin-top:6px" }, f.url),
       ti.tier === "unofficial" || ti.tier === "unknown" ? el("div", { class: "meta " + (ti.tier === "unofficial" ? "warn" : ""), style: "margin-top:4px" }, ti.why.join(" · ")) : null,
       el("div", { class: "acts" },
@@ -654,7 +728,7 @@ function renderSearch() {
       weak && f.website ? el("button", { class: "btn", style: "width:100%;margin-top:8px", onclick: () => runPage(f.website) }, icon("laptop"), `Sacar link completo de ${hostOf(f.website)}`) : null));
   }
   // los que exigen Referer: Safari no puede probarlos, pero en CarTV pueden funcionar (formato «Apps IPTV»)
-  if (j.untested?.length) {
+  if (j.untested?.length && (!S.settings.cartvOnly || S.showAll)) {
     out.append(el("h2", {}, "Sin probar aquí", el("span", { class: "n" }, j.untested.length)),
       el("p", { class: "hint" }, "Necesitan Referer: Safari no los puede probar, pero en CarTV pueden funcionar. Agrégalos si quieres y pruébalos allá."));
     for (const f of j.untested) {
@@ -712,7 +786,7 @@ function addSheet(f) {
   const doAdd = () => {
     const list = S.lists.find((l) => l.id === state.listId);
     if (list.items.some((x) => x.key === f.key)) { toast("Ya está en esa lista"); return; }
-    list.items.push({ id: uid(), tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "",
+    list.items.push({ id: uid(), car: f.car || undefined, tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "",
       group: state.group, live: f.live, res: f.res || "", verifiedAt: f.verifiedAt || 0, status: f.verifiedAt ? "ok" : "" });
     S.active = list.id;
     touch(list);
@@ -735,7 +809,11 @@ function play(it) {
   syncViewport();
   try { playerHls?.destroy(); } catch {}
   playerHls = null;
-  v.onerror = () => ($("#playerMsg").textContent = "Error: " + mediaError(v));
+  v.onerror = async () => {
+    $("#playerMsg").textContent = "No se pudo reproducir. Revisando por qué…";
+    const why = v.error?.code === 3 ? mediaError(v) : await diagnose(it.url, it.referer);
+    put($("#playerMsg"), `No se pudo reproducir: ${why}. `, S.settings.ghToken ? el("button", { class: "btn sm", style: "margin-top:8px", onclick: () => { $("#playerClose").click(); pcCheckSheet(it); } }, icon("laptop"), "Diagnosticar con mi computador") : null);
+  };
   v.onplaying = () => ($("#playerMsg").textContent = `EN VIVO · ${v.videoHeight ? v.videoHeight + "p · " : ""}${hostOf(it.url)}`);
   if (NATIVE_HLS) v.src = it.url;
   else if (window.Hls?.isSupported()) { playerHls = new Hls(); playerHls.on(Hls.Events.ERROR, (_e, d) => { if (d.fatal) $("#playerMsg").textContent = "Error: " + (d.response?.code ? "el servidor respondió " + d.response.code : d.details); }); playerHls.loadSource(it.url); playerHls.attachMedia(v); }
@@ -789,7 +867,9 @@ function itemCard(list, it) {
   const exp = tokenExpiry(it.url);
   return el("div", { class: "card" + (it.status ? " st-" + (it.status === "testing" ? "warn" : it.status) : "") },
     el("div", { class: "ch" }, logoEl(it.logo),
-      el("div", { class: "t" }, el("span", { class: "tier t-" + tierOf(it).tier, title: tierOf(it).why.join(" · ") }, TIER_LABEL[tierOf(it).tier]), el("b", {}, it.name),
+      el("div", { class: "t" }, el("span", { class: "tier t-" + tierOf(it).tier, title: tierOf(it).why.join(" · ") }, TIER_LABEL[tierOf(it).tier]),
+        it.car ? el("span", { class: "tier " + (it.car.ok ? "car-ok" : "car-bad"), style: "margin-left:4px", title: (it.car.why || "") + " · " + ago(it.car.at) }, it.car.ok ? "Apto CarTV" : "No apto CarTV") : null,
+        el("b", {}, it.name),
         el("div", { class: "meta" }, st, it.verifiedAt ? ` · ${ago(it.verifiedAt)}` : "", it.res ? ` · ${it.res}` : "", it.why && it.status === "bad" ? ` · ${it.why}` : ""),
         exp || networkLock(it.url) ? el("div", { class: "meta warn" }, [networkLock(it.url) ? "Amarrado a la red" : "", exp ? (exp < Date.now() ? "Token vencido" : `Vence ${new Date(exp).toLocaleString()}`) : ""].filter(Boolean).join(" · ")) : null),
       el("button", { class: "btn icon", title: "Ver", onclick: () => play(it) }, icon("play")),
@@ -808,10 +888,30 @@ async function retestAll(list) {
   const bad = list.items.filter((x) => x.status === "bad").length;
   toast(bad ? `${bad} canal(es) no funcionan` : "Todos funcionan");
 }
+// Le pide a la extensión la prueba «como CarTV» del link y muestra el veredicto aquí
+function pcCheckSheet(it) {
+  const box = el("div", {}, el("p", { class: "hint" }, el("span", { class: "spin" }), "Enviando el link a tu computador…"));
+  sheet("Diagnóstico · " + it.name, box, [el("button", { class: "btn", onclick: closeSheet }, "Cerrar")]);
+  const my = ++searchToken, job = { step: "", failed: [], found: [], tried: 0 };
+  const show = () => put(box, el("p", { class: "hint" }, el("span", { class: "spin" }), job.step || "Esperando a tu computador…"));
+  const t = setInterval(show, 1000);
+  relayJob({ checkUrl: it.url, referer: it.referer || "" }, job, my, true).then((res) => {
+    const c = res?.check || {};
+    const v = { ok: ["ok", "check", "Funciona en CarTV tal cual."],
+      referer: ["warn", "alert", "Funciona en CarTV solo con Referer: usa el formato «Apps IPTV» (ya viene por defecto)."],
+      browser: ["bad", "x", "No sirve en CarTV: solo funciona dentro de Chrome (el servidor exige las cookies o el origen de la página)."],
+      down: ["bad", "x", "No funciona ni en el computador: " + (c.why || "sin detalle") + "."] }[c.verdict] || ["bad", "x", "Sin respuesta clara."];
+    put(box, el("div", { class: "meta tag " + v[0], style: "font-size:13px;margin-bottom:8px" }, icon(v[1], 14), v[2]),
+      c.lock ? el("p", { class: "hint" }, c.lock) : null,
+      c.exp ? el("p", { class: "hint" }, c.exp < Date.now() ? "El token ya venció: renuévalo desde su página." : `El token vence ${new Date(c.exp).toLocaleString()}.`) : null,
+      c.verdict === "down" || c.verdict === "browser" ? el("p", { class: "hint" }, "Busca el canal de nuevo o extráelo de su página oficial para conseguir un link que sirva.") : null);
+  }).catch((e) => put(box, el("p", { class: "hint bad" }, e.message))).finally(() => clearInterval(t));
+}
 function itemMenu(list, it) {
   const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, icon(i, 18)), t);
   sheet(it.name, [
     opt("refresh", "Probar de nuevo", () => { closeSheet(); retest(list, it); }),
+    S.settings.ghToken ? opt("laptop", "Diagnosticar con mi computador (como CarTV)", () => pcCheckSheet(it)) : null,
     opt("folder", "Mover a categoría", () => moveSheet(list, it)),
     opt("edit", "Cambiar nombre", () => { const n = cleanTitle(prompt("Nuevo nombre", it.name) || ""); if (n) { it.name = n; touch(list); renderLists(); } closeSheet(); }),
     opt("copy", "Copiar link", () => { copyText(it.url, "Link copiado"); closeSheet(); }),
@@ -1004,6 +1104,16 @@ function renderSettings() {
   put($("#vSettings"),
     standalone ? null : el("div", { class: "set" }, el("h3", {}, icon("phone"), "Instalar en el iPhone"),
       el("p", { class: "hint" }, "En Safari toca Compartir (el cuadro con la flecha) y luego «Añadir a pantalla de inicio». Así abre como app, a pantalla completa, y tus listas quedan guardadas.")),
+    el("div", { class: "set" }, el("h3", {}, icon("cast"), "Solo aptos para CarTV"),
+      el("label", { style: "display:flex;gap:10px;align-items:center;text-transform:none;letter-spacing:0;font:inherit;color:var(--text)" },
+        (() => { const c = el("input", { type: "checkbox", checked: S.settings.cartvOnly !== false, style: "width:22px;height:22px" }); c.onchange = () => { S.settings.cartvOnly = c.checked; save({ republish: false }); }; return c; })(),
+        "Mostrar en la búsqueda solo lo que pasó la prueba como CarTV"),
+      el("p", { class: "hint" }, "Tu computador (si está prendido) prueba cada resultado exactamente como lo pide CarTV, incluso los que Safari no puede probar. Tus canales guardados se vuelven a probar solos y llevan la marca «Apto CarTV».")),
+    el("div", { class: "set" }, el("h3", {}, icon("search"), "Orden de la búsqueda"),
+      el("label", { style: "display:flex;gap:10px;align-items:center;text-transform:none;letter-spacing:0;font:inherit;color:var(--text)" },
+        (() => { const c = el("input", { type: "checkbox", checked: S.settings.stopFirst !== false, style: "width:22px;height:22px" }); c.onchange = () => { S.settings.stopFirst = c.checked; save({ republish: false }); }; return c; })(),
+        "Parar en el primer link que funcione"),
+      el("p", { class: "hint" }, "La búsqueda prueba link por link, en el orden de los resultados. Desactívalo para revisarlos todos y elegir tú cuáles agregar.")),
     el("div", { class: "set" }, el("h3", {}, "Formato de las listas"), el("label", {}, "Cómo van el Referer y el User-Agent"), fmt),
     el("div", { class: "set" }, el("h3", {}, "Link fijo (GitHub)"),
       el("p", { class: "hint" }, "Publica cada lista como un Gist secreto de GitHub (gratis). El link no cambia aunque edites la lista."),

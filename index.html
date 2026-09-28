@@ -91,7 +91,9 @@
     .tag { display: inline-flex; align-items: center; gap: 5px; font: 700 10.5px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
     .ok { color: var(--ok); } .bad { color: var(--red); } .warn { color: var(--warn); }
     .tier { display: inline-block; font: 700 9.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; padding: 3px 5px; border-radius: 2px; margin-bottom: 4px; color: var(--dim); box-shadow: inset 0 0 0 1px var(--line2); }
-    .tier.t-official { background: var(--ok); color: #04150a; box-shadow: none; }
+    .tier.t-official { color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); }
+    .tier.car-ok { background: var(--ok); color: #04150a; box-shadow: none; }
+    .tier.car-bad { background: var(--red); color: #fff; box-shadow: none; }
     .tier.t-cdn { color: var(--info); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--info) 55%, transparent); }
     .tier.t-page { color: #2ec5d3; box-shadow: inset 0 0 0 1px color-mix(in srgb, #2ec5d3 55%, transparent); }
     .tier.t-unofficial { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 60%, transparent); }
