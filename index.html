@@ -107,6 +107,16 @@
       font-size: 14px; font-weight: 600; max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
     .chip.on { background: var(--raise); border-color: var(--text); color: var(--text); }
     .chip.add { border-style: dashed; color: var(--info); }
+    .modebar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .modebar select { flex: 1 1 180px; min-width: 0; }
+    .scanf { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .scanf .full { grid-column: 1 / -1; }
+    .scanrow { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--card); margin-top: 6px; }
+    .scanrow.saved { opacity: .55; }
+    .scanrow input[type=checkbox] { width: 22px; height: 22px; flex: 0 0 auto; margin: 2px 0 0; }
+    .scanrow .t { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+    .scanrow .u { font: 11px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .scanbar { position: sticky; bottom: 0; display: flex; gap: 8px; align-items: center; padding: 10px 0; background: var(--bg); flex-wrap: wrap; }
 
     .listhead { display: flex; align-items: center; gap: 8px; margin: 14px 0 4px; }
     .listhead b { font-size: 21px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -167,6 +177,8 @@
 
   <main>
     <section class="view" id="vSearch">
+      <div id="searchMode"></div>
+      <div id="searchPane">
       <form class="search" id="searchForm" autocomplete="off">
         <input class="field" id="q" type="search" placeholder="Nombre del canal, p. ej. Canal Capital" enterkeyhint="search" autocapitalize="off" spellcheck="false">
         <button class="btn primary icon" id="btnSearch" type="submit" aria-label="Buscar" data-icon="search" data-icon-size="20"></button>
@@ -176,6 +188,8 @@
         <button class="btn" id="btnPage" type="submit" data-icon="wand">Extraer</button>
       </form>
       <div id="searchOut"></div>
+      </div>
+      <div id="scanOut" hidden></div>
     </section>
 
     <section class="view" id="vLists" hidden></section>
@@ -205,6 +219,7 @@
 
   <script src="hls.min.js"></script>
   <script src="icons.js"></script>
+  <script src="lang.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

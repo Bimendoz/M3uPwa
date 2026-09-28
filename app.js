@@ -61,12 +61,14 @@ syncViewport();
 const S = {
   lists: store.get("m3u.lists", null),
   active: store.get("m3u.active", ""),
-  settings: { format: "iptv", ghToken: "", cartvOnly: true, searchCount: 10, ...store.get("m3u.settings", {}) },
+  settings: { format: "iptv", ghToken: "", cartvOnly: true, searchCount: 0, langMode: "latam", countries: [], portableOnly: true, ...store.get("m3u.settings", {}) },
   showAll: false, // mostrar también lo que no pasó (o no se pudo confirmar) la prueba como CarTV
   view: "vSearch", listCat: "*",
   search: null // { query, running, step, tried, failed:[], found:[] }
 };
 // Una sola vez: el formato viejo por defecto («both») pasa a «iptv», que es el que CarTV entiende
+// v5.2: «no omitir ningún link» → las búsquedas pasan a probar TODOS los links (se puede volver a poner un número)
+if (!S.settings.allLinksV1) { S.settings.searchCount = 0; S.settings.allLinksV1 = true; store.set("m3u.settings", S.settings); }
 if (!S.settings.fmtV2) { if (S.settings.format === "both") S.settings.format = "iptv"; S.settings.fmtV2 = true; store.set("m3u.settings", S.settings); }
 if (!Array.isArray(S.lists) || !S.lists.length) S.lists = [{ id: uid(), name: "Mi lista", categories: [], items: [] }];
 if (!S.lists.some((l) => l.id === S.active)) S.active = S.lists[0].id;
@@ -104,26 +106,43 @@ function networkLock(url) {
     for (const [k, v] of new URL(url).searchParams) {
       if (/^(asn|isp)$/i.test(k) && /^\d{2,10}$/.test(v)) return "red";
       if (/^(ip|cip|clientip|client_ip|userip)$/i.test(k) && /^[\d.:a-f]{7,}$/i.test(v)) return "ip";
+      // también dentro de un token (hdnts=exp=…~ip=1.2.3.4~acl=…)
+      const im = v.match(/(?:^|[~&;,:])(ip|clientip|cip|asn)=([\d.:a-f]{2,})/i);
+      if (im && (/asn/i.test(im[1]) ? /^\d{2,10}$/.test(im[2]) : /^[\d.:a-f]{7,}$/i.test(im[2]))) return /asn/i.test(im[1]) ? "red" : "ip";
     }
   } catch {}
   return "";
 }
 
+// ¿Sirve fuera de la red donde se sacó? "" = sí · texto = por qué no (mismo criterio que la extensión)
+const portableOn = () => S.settings.portableOnly !== false;
+function portableIssue(url, canRenew) {
+  if (networkLock(url)) return "amarrado a la red donde se sacó: no funciona con datos ni en otra red";
+  const exp = tokenExpiry(url);
+  if (exp && exp - Date.now() < 6 * 3600e3 && !canRenew) return `el link vence ${exp <= Date.now() ? "ya" : "en " + Math.max(1, Math.round((exp - Date.now()) / 60e3)) + " min"} y no hay página para renovarlo`;
+  return "";
+}
+
 // ---------- M3U ----------
-// both = VLC + apps IPTV · iptv = CarTV/Kodi (url|Referer=…) · vlc = solo VLC
+// both = VLC + apps IPTV · iptv = CarTV/Kodi (url|User-Agent=…&Referer=…) · vlc = solo VLC
+// User-Agent de la lista = el del ejemplo que funciona en CarTV (Blu Radio): Chrome de escritorio, MISMO que la extensión.
+const CARTV_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
 function m3uEntry(it, group, format) {
   const q = (v) => oneLine(v).replace(/"/g, "'");
-  const ua = navigator.userAgent;
+  const ua = oneLine(it.ua) || CARTV_UA;
   let a = ` tvg-name="${q(it.name)}"`;
   if (it.tvgId) a += ` tvg-id="${q(it.tvgId)}"`;
   if (it.logo) a += ` tvg-logo="${q(it.logo)}"`;
   if (group) a += ` group-title="${q(group)}"`;
   const ref = it.referer ? oneLine(it.referer) : "";
-  if (ref && format !== "vlc") a += ` http-referrer="${q(ref)}" http-user-agent="${q(ua)}"`;
+  // «Apps IPTV» (CarTV): SIEMPRE con User-Agent (atributo, #EXTHTTP y «|User-Agent=»), como el ejemplo que funciona
+  const iptv = format === "iptv", yt = /youtube\.com|youtu\.be/i.test(it.url);
+  if (!yt && (iptv || (ref && format !== "vlc"))) a += (ref ? ` http-referrer="${q(ref)}"` : "") + ` http-user-agent="${q(ua)}"`;
   let s = `#EXTINF:-1${a},${q(it.name)}\n`;
   if (ref && format !== "iptv") s += `#EXTVLCOPT:http-referrer=${ref}\n#EXTVLCOPT:http-user-agent=${ua}\n`;
+  if (!yt && (iptv || (ref && format !== "vlc"))) s += `#EXTHTTP:${JSON.stringify(ref ? { "User-Agent": ua, Referer: ref } : { "User-Agent": ua })}\n`;
   let u = it.url;
-  if (ref && format === "iptv") u += `|User-Agent=${encodeURIComponent(ua)}&Referer=${encodeURIComponent(ref)}`;
+  if (!yt && iptv) u += `|User-Agent=${encodeURIComponent(ua)}` + (ref ? `&Referer=${encodeURIComponent(ref)}` : "");
   return s + u + "\n";
 }
 const groupOf = (it) => it.group || (it.live === false ? "Grabados" : "En vivo");
@@ -144,13 +163,15 @@ function parseM3u(text) {
       const m = l.match(/^#EXTINF:[^,"]*(?:"[^"]*"[^,"]*)*,(.*)$/);
       cur.name = (m ? m[1] : l.slice(l.indexOf(",") + 1)).trim();
       const g = (k) => (l.match(new RegExp(k + '="([^"]*)"')) || [])[1] || "";
-      cur.logo = g("tvg-logo"); cur.group = g("group-title"); cur.tvgId = g("tvg-id"); cur.referer = g("http-referrer") || cur.referer || "";
+      cur.logo = g("tvg-logo"); cur.group = g("group-title"); cur.tvgId = g("tvg-id"); cur.referer = g("http-referrer") || cur.referer || ""; cur.ua = g("http-user-agent") || cur.ua || "";
     } else if (l.startsWith("#EXTVLCOPT:http-referrer=")) cur.referer = l.slice(25);
+    else if (l.startsWith("#EXTVLCOPT:http-user-agent=")) cur.ua = l.slice(27);
+    else if (l.startsWith("#EXTHTTP:")) { try { const j = JSON.parse(l.slice(9)); if (j.Referer) cur.referer = j.Referer; if (j["User-Agent"]) cur.ua = j["User-Agent"]; } catch {} }
     else if (!l.startsWith("#")) {
       let url = l;
       const p = l.indexOf("|");
-      if (p > 0) { url = l.slice(0, p); const r = new URLSearchParams(l.slice(p + 1)).get("Referer"); if (r) cur.referer = r; }
-      if (/^https?:\/\//i.test(url)) out.push({ name: cur.name || hostOf(url) || "Canal", url, referer: cur.referer || "", logo: cur.logo || "", group: cur.group || "", tvgId: cur.tvgId || "" });
+      if (p > 0) { url = l.slice(0, p); const pp = new URLSearchParams(l.slice(p + 1)); if (pp.get("Referer")) cur.referer = pp.get("Referer"); if (pp.get("User-Agent")) cur.ua = pp.get("User-Agent"); }
+      if (/^https?:\/\//i.test(url)) out.push({ name: cur.name || hostOf(url) || "Canal", url, referer: cur.referer || "", logo: cur.logo || "", group: cur.group || "", tvgId: cur.tvgId || "", ua: cur.ua || "" });
       cur = {};
     }
   }
@@ -204,19 +225,20 @@ async function relayGistId() {
   return id;
 }
 // Encarga a la extensión una búsqueda ({query}) o una extracción ({pageUrl}) y espera la respuesta.
-async function relayJob(payload, job, my, raw = false) {
-  job.step = "Enviando el encargo a tu computador…"; job.viaPc = true; renderSearch();
+async function relayJob(payload, job, my, raw = false, o = {}) {
+  const alive = o.alive || (() => my === searchToken), redraw = o.render || renderSearch;
+  job.step = "Enviando el encargo a tu computador…"; job.viaPc = true; redraw();
   const triedBase = job.tried || 0; // lo que ya probó el iPhone + lo que pruebe el computador
   let id = await relayGistId();
   const rid = uid();
   try { await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: { content: JSON.stringify({ ...payload, at: Date.now() }) } } }) }); }
   catch (e) { if (!/404/.test(e.message)) throw e; S.settings.relayGistId = ""; S.settings.relayGistAt = 0; id = await relayGistId(); await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: { content: JSON.stringify({ ...payload, at: Date.now() }) } } }) }); }
-  job.step = "Esperando a tu computador (revisa cada 30 s)…"; renderSearch();
+  job.step = "Esperando a tu computador (revisa cada 30 s)…"; redraw();
   const t0 = Date.now();
-  let acked = false;
-  while (my === searchToken) {
+  let acked = false, lastAt = 0, lastMove = Date.now();
+  while (alive()) {
     await new Promise((r) => setTimeout(r, 5000));
-    if (my !== searchToken) break;
+    if (!alive()) break;
     let g;
     try { g = await ghApi(`/gists/${id}`); } catch { continue; }
     const f = g.files[`res-${rid}.json`];
@@ -225,9 +247,10 @@ async function relayJob(payload, job, my, raw = false) {
       try { res = JSON.parse(f.truncated ? await (await fetchT(f.raw_url)).text() : f.content); } catch {}
       if (res) {
         acked = true;
+        if (res.at !== lastAt) { lastAt = res.at; lastMove = Date.now(); } // el computador sigue avanzando
         job.step = "Tu computador: " + res.step; if (!raw) job.tried = triedBase + (res.tried || 0);
         if (Array.isArray(res.pages)) job.pages = res.pages;
-        renderSearch();
+        redraw();
         if (res.status === "done") {
           ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`res-${rid}.json`]: null } }) }).catch(() => {});
           for (const x of res.failed || []) job.failed.push({ host: x.host, why: "(computador) " + x.why });
@@ -239,7 +262,7 @@ async function relayJob(payload, job, my, raw = false) {
       ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: null } }) }).catch(() => {});
       throw new Error("Tu computador no respondió. Revisa que esté prendido con Chrome abierto, y que la extensión esté conectada al mismo GitHub (Opciones, «Puente con la app del iPhone»).");
     }
-    if (acked && Date.now() - t0 > 5 * 60e3) throw new Error("Tu computador tardó demasiado. Intenta de nuevo.");
+    if (acked && Date.now() - lastMove > 4 * 60e3) throw new Error("Tu computador dejó de responder. Intenta de nuevo.");
   }
   return [];
 }
@@ -248,12 +271,15 @@ async function addPcResults(found, job, my) {
   for (const f of found) {
     if (my !== searchToken || job.found.some((x) => x.key === keyOf(f.url))) continue;
     const item = { car: f.car, tier: f.tier || sourceInfo(f.url, { pageUrl: f.pageUrl }).tier, tierWhy: f.tierWhy || [], url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
-      live: f.live, res: f.res ? String(f.res).split("x").pop() + "p" : "", verifiedAt: f.verifiedAt || Date.now(), lock: networkLock(f.url), exp: tokenExpiry(f.url), viaPc: true };
+      live: f.live, res: f.res ? String(f.res).split("x").pop() + "p" : "", verifiedAt: f.verifiedAt || Date.now(), lock: networkLock(f.url), exp: tokenExpiry(f.url), viaPc: true,
+      lang: f.lang || "", audio: f.audio || [], country: f.country || "" };
+    const pi = portableOn() ? portableIssue(f.url, !!f.pageUrl) : "";
+    if (pi) { job.failed.push({ host: hostOf(f.url), why: pi }); renderSearch(); continue; }
     if (f.needs === "referer") item.note = "Probado por tu computador (necesita Referer: Safari no puede probarlo)";
     else {
       job.step = `Probando aquí ${hostOf(f.url)}…`; renderSearch();
-      try { const r = await verifyVideo(f.url); item.res = r.h ? r.h + "p" : item.res; item.note = "Probado por tu computador y en este equipo"; }
-      catch (e) { item.note = `Funciona en tu computador pero aquí no: ${e.message}`; item.warn = true; }
+      try { const r = await verifyVideo(f.url); item.res = r.h ? r.h + "p" : item.res; item.note = "Apto CarTV y también abre en este celular"; }
+      catch (e) { item.note = `Apto CarTV (probado por tu computador) · en Safari no abrió: ${e.message}`; }
     }
     job.found.push(item); renderSearch();
   }
@@ -429,7 +455,8 @@ async function dirJson(name) {
   }
 }
 // Servicios que solo entregan el directo con la sesión de su reproductor: el link del directorio suele fallar en CarTV
-const needsPlayerSession = (url) => { try { const u = new URL(url); return /(^|\.)(mdstrm\.com|mediastream\.[a-z.]+)$/i.test(u.hostname) && !u.searchParams.has("player"); } catch { return false; } };
+// (los /live-stream-playlist/ de Mediastream funcionan sin sesión: ejemplo de Blu Radio en CarTV)
+const needsPlayerSession = (url) => { try { const u = new URL(url); return /(^|\.)(mdstrm\.com|mediastream\.[a-z.]+)$/i.test(u.hostname) && !u.searchParams.has("player") && !/\/live-stream-playlist\//i.test(u.pathname); } catch { return false; } };
 const STOP = new Set(["canal", "tv", "television", "hd", "channel", "en", "vivo", "el", "la", "de", "del", "y", "senal", "live"]);
 const norm = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const words = (s) => norm(s).split(" ").filter((w) => w && !STOP.has(w));
@@ -447,31 +474,44 @@ function nameScore(query, name) {
   return 0;
 }
 const userCountry = () => ((navigator.language || "").match(/-([A-Z]{2})$/i) || [])[1]?.toUpperCase() || "";
-async function candidates(query) {
+async function candidates(query, mode = "any", wantCountries = []) {
+  mode = langMode(mode);
+  const want = cleanCountries(wantCountries);
   const [channels, streams] = await Promise.all([dirJson("channels"), dirJson("streams")]);
-  let logos = [];
+  let logos = [], feeds = [], countries = [];
   try { logos = await dirJson("logos"); } catch {}
+  try { [feeds, countries] = await Promise.all([dirJson("feeds"), dirJson("countries")]); } catch {}
+  const idx = buildLangIndex(feeds, countries);
+  const byId = new Map(channels.map((c) => [c.id, c]));
+  const feedsOf = new Map();
+  for (const f of feeds) { if (!feedsOf.has(f.channel)) feedsOf.set(f.channel, []); feedsOf.get(f.channel).push(f); }
+  const chOk = (c) => (feedsOf.get(c.id) || [null]).some((f) => { const s0 = { channel: c.id, feed: f?.id };
+    return langOk(streamLang(s0, c, idx), mode) && countryOk(c.country, streamAreas(s0, idx), want); });
   const cc = userCountry();
   const scored = [];
   for (const c of channels) {
     if (c.is_nsfw || c.closed) continue;
     const best = Math.max(nameScore(query, c.name), ...(c.alt_names || []).map((a) => nameScore(query, a)));
-    if (best) scored.push({ c, score: best + (cc && c.country === cc ? 8 : 0) });
+    if (best && chOk(c)) scored.push({ c, score: best + (cc && c.country === cc ? 8 : 0) });
   }
   scored.sort((a, b) => b.score - a.score);
-  const top = new Map(scored.slice(0, 8).map((x) => [x.c.id, x]));
-  const logoOf = (id) => top.get(id)?.c.logo || logos.find((l) => l.channel === id)?.url || "";
+  const top = new Map(scored.map((x) => [x.c.id, x])); // TODOS los canales que coinciden
+  const logoOf = (id) => byId.get(id)?.logo || logos.find((l) => l.channel === id)?.url || "";
   const out = [];
   for (const s of streams) {
     if (!s.url || !/\.m3u8(\?|$)/i.test(s.url)) continue;
     const hit = top.get(s.channel);
     const ts = !hit && s.title ? nameScore(query, s.title) : 0;
     if (!hit && ts < 70) continue;
-    out.push({ url: s.url, referer: s.referrer || "", name: hit ? hit.c.name : s.title, logo: hit ? logoOf(hit.c.id) : "",
-      tvgId: hit ? hit.c.id : "", website: hit?.c.website || "", score: hit ? hit.score : ts });
+    const ch = hit?.c || byId.get(s.channel) || null;
+    const lang = streamLang(s, ch, idx);
+    if (!langOk(lang, mode) || !countryOk(ch?.country || "", streamAreas(s, idx), want)) continue;
+    out.push({ url: s.url, referer: s.referrer || "", name: hit ? hit.c.name : s.title, logo: ch ? logoOf(ch.id) : "",
+      tvgId: ch ? ch.id : "", website: ch?.website || "", country: ch?.country || "", score: hit ? hit.score : ts, lang: lang.label, langInfo: lang });
   }
-  out.sort((a, b) => b.score - a.score);
-  const sites = [...new Set(scored.slice(0, 3).filter((x) => x.score >= 60 && x.c.website).map((x) => x.c.website))];
+  // español latino primero; dentro de cada idioma, el nombre que más se parece
+  out.sort((a, b) => (mode === "any" ? 0 : langRank(a.langInfo) - langRank(b.langInfo)) || b.score - a.score);
+  const sites = [...new Set(scored.filter((x) => x.score >= 60 && x.c.website).map((x) => x.c.website))];
   return { streams: out, sites };
 }
 
@@ -548,9 +588,9 @@ const MAX_FOUND = Infinity, MAX_TESTS = Infinity; // sin límite: se prueban tod
 // Orden estricto: un link a la vez, en el orden de la búsqueda; con «parar en el primero» termina apenas uno funciona
 // «Links a probar»: igual que la extensión, cada búsqueda prueba exactamente esa cantidad, uno por uno y en orden
 // (directorio aquí en el iPhone → sitio oficial y web con tu computador). No se detiene aunque alguno funcione.
-const searchCountOf = (v) => Math.max(1, Math.round(+v) || 10);
+const searchCountOf = (v) => (v === "" || v == null || !Number.isFinite(+v) ? 0 : Math.max(0, Math.round(+v))); // 0 = todos
 const goalOf = () => searchCountOf(S.settings.searchCount);
-const searchDone = (job) => job.tried >= (job.goal || goalOf());
+const searchDone = (job) => job.goal > 0 && job.tried >= job.goal; // goal 0 = todos: nunca «ya basta»
 let searchToken = 0;
 async function runSearch(query) {
   query = cleanTitle(query);
@@ -559,10 +599,10 @@ async function runSearch(query) {
   const job = S.search = { query, goal: goalOf(), running: true, step: "Buscando en el directorio de canales…", tried: 0, failed: [], found: [], untested: [], sites: [] };
   renderSearch();
   try {
-    const { streams, sites } = await candidates(query);
+    const { streams, sites } = await candidates(query, S.settings.langMode, S.settings.countries);
     job.sites = sites;
     const list = streams.slice(0, MAX_TESTS);
-    job.step = list.length ? `Directorio: ${list.length} link(s) del canal · los reproduzco uno por uno, en orden (meta: ${job.goal})…` : "No está en el directorio de canales.";
+    job.step = list.length ? `Directorio: ${list.length} link(s) del canal · los reproduzco uno por uno, en orden${job.goal ? ` (meta: ${job.goal})` : " (todos)"}…` : "No está en el directorio de canales.";
     renderSearch();
     const seen = new Set();
     const conc = 1; // de a uno, en el orden de la búsqueda
@@ -574,14 +614,17 @@ async function runSearch(query) {
         if (seen.has(k)) continue;
         seen.add(k);
         job.tried++; renderSearch();
+        const pi = portableOn() ? portableIssue(c.url, !!c.website) : "";
+        if (pi) { job.failed.push({ host: hostOf(c.url), why: pi }); renderSearch(); continue; }
         try {
           const r = await verifyVideo(c.url, 12000);
           if (my !== searchToken) return;
           const si = sourceInfo(c.url, { website: c.website });
           job.found.push({ ...c, tier: si.tier, tierWhy: si.why, key: k, live: r.live, res: r.h ? r.h + "p" : r.audioOnly ? "solo audio" : "", verifiedAt: Date.now(), lock: networkLock(c.url), exp: tokenExpiry(c.url) });
         } catch (e) {
-          if (c.referer) { const si = sourceInfo(c.url, { website: c.website }); job.untested.push({ ...c, tier: si.tier, tierWhy: si.why, key: k }); }
-          else job.failed.push({ host: hostOf(c.url), why: e.message });
+          // lo que importa es CarTV, no Safari: lo que aquí no abre lo prueba tu computador como CarTV
+          const si = sourceInfo(c.url, { website: c.website });
+          job.untested.push({ ...c, tier: si.tier, tierWhy: si.why, key: k, safariWhy: c.referer ? "necesita Referer" : e.message });
         }
         renderSearch();
       }
@@ -595,12 +638,12 @@ async function runSearch(query) {
     if (!searchDone(job) && S.settings.ghToken && job.pcState !== "off") { // si el computador ya no respondió, no se le vuelve a esperar
       const had = job.found.length;
       job.pcSearched = true;
-      await addPcResults(await relayJob({ query, skipDirTests: q.length === 0, searchCount: job.goal - job.tried }, job, my), job, my);
+      await addPcResults(await relayJob({ query, skipDirTests: q.length === 0, searchCount: job.goal ? job.goal - job.tried : 0, langMode: langMode(S.settings.langMode), countries: cleanCountries(S.settings.countries), portableOnly: portableOn() }, job, my), job, my);
       if (my !== searchToken) return;
       job.viaPc = false;
       job.step = `${job.found.length} funcionan de ${job.tried} probado(s)${job.found.length > had ? ` · ${job.found.length - had} por tu computador (sitio oficial y web)` : ""}.`;
-    } else if (!searchDone(job) && !S.settings.ghToken) job.step += ` Llevo ${job.tried} de ${job.goal}: para seguir con el sitio oficial y la web, conecta en Ajustes el mismo GitHub de la extensión.`;
-    if (job.tried < job.goal) job.step += ` Pediste ${job.goal}, pero solo encontré ${job.tried} link(s) para probar.`;
+    } else if (!searchDone(job) && !S.settings.ghToken) job.step += ` Llevo ${job.tried}${job.goal ? ` de ${job.goal}` : ""}: para seguir con el sitio oficial y la web, conecta en Ajustes el mismo GitHub de la extensión.`;
+    if (job.goal && job.tried < job.goal) job.step += ` Pediste ${job.goal}, pero solo encontré ${job.tried} link(s) para probar.`;
   } catch (e) {
     if (my !== searchToken) return;
     job.step = job.viaPc ? e.message : "No se pudo leer el directorio de canales. Revisa tu conexión e intenta de nuevo.";
@@ -672,7 +715,7 @@ async function runPage(pageUrl) {
 async function runPcSearch(query) {
   const my = ++searchToken;
   const job = S.search = { query, running: true, step: "", tried: 0, failed: [], found: [], sites: [], viaPc: true };
-  try { job.goal = goalOf(); await addPcResults(await relayJob({ query, searchCount: job.goal }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
+  try { job.goal = goalOf(); await addPcResults(await relayJob({ query, searchCount: job.goal, langMode: langMode(S.settings.langMode), countries: cleanCountries(S.settings.countries), portableOnly: portableOn() }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
   catch (e) { if (my === searchToken) job.step = e.message; }
   finally { if (my === searchToken) { job.running = false; renderSearch(); } }
 }
@@ -732,7 +775,7 @@ function renderSearch() {
   if (S.showAll && S.settings.cartvOnly) out.append(el("button", { class: "btn sm", style: "margin:4px 0 6px", onclick: () => { S.showAll = false; renderSearch(); } }, icon("filter", 14), "Ver solo aptos para CarTV"));
   for (const f of shown) {
     const ti = tierOf(f);
-    const info = [f.car ? (f.car.ok ? "Apto CarTV" : "No apto CarTV") : f.warn ? "Verificado solo en tu computador" : j.pcState === "confirming" ? "Confirmando CarTV…" : "Probado en el iPhone", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
+    const info = [f.car ? (f.car.ok ? "Apto CarTV" : "No apto CarTV") : f.warn ? "Verificado solo en tu computador" : j.pcState === "confirming" ? "Confirmando CarTV…" : "Probado en el iPhone", f.lang || "", audioLabel(f.audio), f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
     const weak = needsPlayerSession(f.url);
     const notes = [f.note || "", weak ? "Link sin la sesión del reproductor: puede fallar en CarTV. Mejor sácalo de la página oficial." : "", f.lock ? `Solo funciona en la red donde lo probaste (${f.lock === "ip" ? "tu IP" : "tu proveedor"})` : "", f.exp ? `Vence ${new Date(f.exp).toLocaleString()}` : ""].filter(Boolean);
     out.append(el("div", { class: "card " + (f.warn || weak ? "st-warn" : "st-ok") },
@@ -746,20 +789,204 @@ function renderSearch() {
         el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, icon("copy"))),
       weak && f.website ? el("button", { class: "btn", style: "width:100%;margin-top:8px", onclick: () => runPage(f.website) }, icon("laptop"), `Sacar link completo de ${hostOf(f.website)}`) : null));
   }
-  // los que exigen Referer: Safari no puede probarlos, pero en CarTV pueden funcionar (formato «Apps IPTV»)
+  // los que Safari no abrió (o exigen Referer) y el computador no confirmó: en CarTV pueden funcionar
   if (j.untested?.length && (!S.settings.cartvOnly || S.showAll)) {
     out.append(el("h2", {}, "Sin probar aquí", el("span", { class: "n" }, j.untested.length)),
-      el("p", { class: "hint" }, "Necesitan Referer: Safari no los puede probar, pero en CarTV pueden funcionar. Agrégalos si quieres y pruébalos allá."));
+      el("p", { class: "hint" }, "Safari no los pudo abrir y tu computador no los ha confirmado. En CarTV pueden funcionar: conecta GitHub (Ajustes) para que tu computador los pruebe como CarTV."));
     for (const f of j.untested) {
       const ti = tierOf(f);
       out.append(el("div", { class: "card st-warn" },
         el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("span", { class: "tier t-" + ti.tier, title: ti.why.join(" · ") }, TIER_LABEL[ti.tier]), el("b", {}, f.name),
-          el("div", { class: "meta tag warn" }, icon("alert", 12), "Sin probar · necesita Referer"))),
+          el("div", { class: "meta tag warn" }, icon("alert", 12), `Falta la prueba como CarTV · Safari: ${f.safariWhy || "necesita Referer"}`))),
         el("div", { class: "meta", style: "margin-top:6px" }, f.url),
         el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => addSheet(f) }, icon("plus"), "Agregar igual"),
           el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, icon("copy")))));
     }
   }
+}
+
+// ---------- idioma y escaneo global (espejo de la extensión) ----------
+S.searchMode = "search";
+S.scanForm = { category: "", max: 0 }; // 0 = todos
+S.countryOpen = false;
+S.scanSel = new Set();
+S.scan = null;
+let scanToken = 0;
+function renderSearchMode() {
+  const lang = el("select", { class: "field", "aria-label": "Idioma" }, LANG_MODES.map(([v, t]) => el("option", { value: v }, t)));
+  lang.value = langMode(S.settings.langMode);
+  lang.onchange = () => { S.settings.langMode = lang.value; save({ republish: false }); toast("Idioma: " + lang.selectedOptions[0].textContent); };
+  const chip = (v, ic, t) => el("button", { class: "chip" + (S.searchMode === v ? " on" : ""), type: "button", onclick: () => { S.searchMode = v; renderSearchMode(); } }, icon(ic, 14), t);
+  // Países (varios a la vez): se usan en la búsqueda por nombre y en el escaneo global
+  const want = cleanCountries(S.settings.countries);
+  const setC = (list) => { S.settings.countries = cleanCountries(list); save({ republish: false }); renderSearchMode(); };
+  const cchip = (code, label) => {
+    const on = code === "" ? !want.length : want.includes(code);
+    return el("button", { class: "chip" + (on ? " on" : ""), type: "button", onclick: () => code === "" ? setC([]) : setC(on ? want.filter((c) => c !== code) : [...want, code]) }, label);
+  };
+  const head = el("button", { class: "chip" + (want.length ? " on" : ""), type: "button", style: "width:100%;justify-content:space-between", onclick: () => { S.countryOpen = !S.countryOpen; renderSearchMode(); } },
+    el("span", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, "Países: " + countriesLabel(want)), icon(S.countryOpen ? "x" : "plus", 14));
+  put($("#searchMode"), el("div", { class: "modebar" }, chip("search", "search", "Buscar canal"), chip("scan", "globe", "Escaneo global"), lang),
+    head, S.countryOpen ? el("div", { class: "chips", style: "flex-wrap:wrap" }, cchip("", "Todos"), cchip("LATAM", "Toda Latinoamérica"),
+      LATAM_SPANISH.map(([c, n]) => cchip(c, n)), cchip("US", "EE. UU. (hispanos)"), cchip("ES", "España")) : null);
+  $("#searchPane").hidden = S.searchMode !== "search";
+  $("#scanOut").hidden = S.searchMode !== "scan";
+  if (S.searchMode === "scan") renderScan();
+}
+// Lista del escaneo: MISMA lógica que scanList() de la extensión (lib/scan.js)
+async function scanList(f) {
+  const mode = langMode(f.langMode);
+  const [channels, streams] = await Promise.all([dirJson("channels"), dirJson("streams")]);
+  let feeds = [], countries = [], logos = [], blocked = new Set();
+  try { [feeds, countries] = await Promise.all([dirJson("feeds"), dirJson("countries")]); } catch {}
+  try { logos = await dirJson("logos"); } catch {}
+  try { blocked = new Set((await dirJson("blocklist")).map((b) => b.channel)); } catch {}
+  const idx = buildLangIndex(feeds, countries);
+  const byId = new Map(channels.map((c) => [c.id, c]));
+  const logoBy = new Map();
+  for (const l of logos) if (!logoBy.has(l.channel)) logoBy.set(l.channel, l.url);
+  const want = cleanCountries(f.countries);
+  const order = SPANISH_COUNTRIES.map(([c]) => c);
+  const seen = new Set(), out = [];
+  for (const s of streams) {
+    if (!s.url || !/\.m3u8(\?|$)/i.test(s.url)) continue;
+    const ch = byId.get(s.channel);
+    if (!ch || ch.closed || ch.is_nsfw || blocked.has(ch.id)) continue;
+    if (f.category && !(ch.categories || []).includes(f.category)) continue;
+    if (!countryOk(ch.country, streamAreas(s, idx), want)) continue;
+    const lang = streamLang(s, ch, idx);
+    if (!langOk(lang, mode)) continue;
+    const k = keyOf(s.url);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ url: s.url, referer: s.referrer || "", name: s.title || ch.name, logo: logoBy.get(ch.id) || "", tvgId: ch.id, website: ch.website || "",
+      country: ch.country || "", lang: lang.label, langInfo: lang, geo: /geo-?block/i.test(s.label || "") });
+  }
+  const oi = (c) => { const i = order.indexOf(c); return i < 0 ? 99 : i; };
+  out.sort((a, b) => (mode === "any" ? 0 : langRank(a.langInfo) - langRank(b.langInfo)) || oi(a.country) - oi(b.country)
+    || String(a.country).localeCompare(String(b.country)) || String(a.name).localeCompare(String(b.name), "es"));
+  return out;
+}
+const scanFilters = () => ({ portableOnly: portableOn(), langMode: langMode(S.settings.langMode), countries: cleanCountries(S.settings.countries), category: S.scanForm.category, max: S.scanForm.max });
+// Escanear aquí (Safari): reproduce cada link, uno por uno y en orden. Los que exigen Referer no se pueden probar aquí.
+async function runScanHere() {
+  const my = ++scanToken, f = scanFilters();
+  const job = S.scan = { running: true, where: "iPhone", step: "Leyendo el directorio de canales…", tried: 0, goal: 0, total: 0, found: [], failed: [], skipped: 0 };
+  S.scanSel.clear(); renderScan();
+  try {
+    const list = await scanList(f);
+    job.total = list.length;
+    const todo = f.max ? list.slice(0, f.max) : list;
+    job.goal = todo.length;
+    for (const c of todo) {
+      if (my !== scanToken) return;
+      job.tried++;
+      job.step = `Probando ${job.tried} de ${todo.length}: ${c.name}`;
+      renderScan();
+      if (c.referer) { job.skipped++; job.failed.push({ name: c.name, why: "necesita Referer: Safari no lo puede probar (escanea con tu computador)" }); continue; }
+      try {
+        const r = await verifyVideo(c.url, 12000);
+        if (my !== scanToken) return;
+        const pi = portableOn() ? portableIssue(c.url, !!c.website) : "";
+        if (pi) throw new Error(pi);
+        const si = sourceInfo(c.url, { website: c.website });
+        job.found.push({ ...c, tier: si.tier, tierWhy: si.why, key: keyOf(c.url), live: r.live, res: r.h ? r.h + "p" : r.audioOnly ? "solo audio" : "",
+          verifiedAt: Date.now(), lock: networkLock(c.url), exp: tokenExpiry(c.url) });
+      } catch (e) { job.failed.push({ name: c.name, host: hostOf(c.url), why: e.message }); }
+    }
+    job.step = `Listo: ${job.found.length} funcionan de ${job.tried} probado(s)${list.length > todo.length ? ` (había ${list.length}; sube la cantidad para probar más)` : ""}.`;
+  } catch (e) {
+    if (my === scanToken) job.step = "No se pudo leer el directorio de canales. Revisa tu conexión.";
+  } finally {
+    if (my === scanToken) { job.running = false; renderScan(); }
+  }
+}
+// Escanear con el computador: el mismo motor de la extensión (prueba como CarTV, también los que exigen Referer)
+async function runScanPc() {
+  if (!S.settings.ghToken) { toast("Conecta GitHub en Ajustes"); return setView("vSettings"); }
+  const my = ++scanToken;
+  const job = S.scan = { running: true, where: "computador", step: "", tried: 0, goal: 0, total: 0, found: [], failed: [] };
+  S.scanSel.clear(); renderScan();
+  const alive = () => my === scanToken;
+  try {
+    const res = await relayJob({ scan: scanFilters() }, job, my, true, { alive, render: renderScan });
+    if (!alive()) return;
+    job.tried = res?.tried || 0; job.goal = res?.goal || 0; job.total = res?.total || 0;
+    for (const f of res?.found || []) {
+      const pi = portableOn() ? portableIssue(f.url, !!f.pageUrl) : "";
+      if (pi) { job.failed.push({ name: f.name, why: pi }); continue; }
+      job.found.push({ ...f, logo: f.thumb || "", res: f.res ? String(f.res).split("x").pop() + "p" : "", exp: tokenExpiry(f.url), viaPc: true });
+    }
+    job.step = `${job.found.length} aptos para CarTV · tu computador: ${res?.step || "listo"}`;
+  } catch (e) { if (alive()) job.step = e.message; }
+  finally { if (alive()) { job.running = false; job.viaPc = false; renderScan(); } }
+}
+function stopScan() { scanToken++; if (S.scan) { S.scan.running = false; S.scan.step = "Escaneo detenido."; } renderScan(); }
+function renderScan() {
+  const out = $("#scanOut");
+  if (!out || S.searchMode !== "scan") return;
+  const j = S.scan, running = !!j?.running, F = S.scanForm;
+  const cat = el("select", { class: "field" }, SCAN_CATEGORIES.map(([c, n]) => el("option", { value: c }, n)));
+  cat.value = F.category; cat.onchange = () => (F.category = cat.value);
+  const max = el("input", { class: "field", type: "number", min: "0", step: "1", inputmode: "numeric", value: String(F.max) });
+  max.onchange = () => { F.max = Math.max(0, Math.round(+max.value) || 0); max.value = String(F.max); };
+  const nodes = [el("div", { class: "scanf" },
+    el("div", { class: "full" }, el("label", {}, "Categoría"), cat),
+    el("div", { class: "full" }, el("label", {}, "Cuántos links probar (0 = todos)"), max),
+    running ? el("button", { class: "btn full", type: "button", onclick: stopScan }, icon("x"), "Detener")
+      : el("div", { class: "full acts", style: "display:flex;gap:8px" },
+        el("button", { class: "btn primary", style: "flex:1", type: "button", onclick: () => { max.onchange(); runScanPc(); } }, icon("laptop"), "Con mi computador"),
+        el("button", { class: "btn", style: "flex:1", type: "button", onclick: () => { max.onchange(); runScanHere(); } }, icon("phone"), "Aquí en el iPhone")))];
+  nodes.push(el("p", { class: "hint" }, "«Con mi computador» es más rápido y prueba como CarTV (también los que exigen Referer). «Aquí» reproduce cada link en Safari, uno por uno."));
+  if (j) {
+    const st = el("div", { class: "status" + (running ? " run" : "") },
+      el("div", {}, running ? el("span", { class: "spin" }) : null, j.step),
+      el("div", { class: "meta" }, `${j.tried} de ${j.goal} probado(s) · ${j.found.length} funcionan${j.total ? ` · ${j.total} cumplen los filtros` : ""}`));
+    if (j.failed.length) st.append(el("details", {}, el("summary", {}, "Ver por qué se descartaron (últimos)"), el("ul", {}, j.failed.slice(-20).map((f) => el("li", {}, `${f.name || f.host}: ${f.why}`)))));
+    nodes.push(st);
+  }
+  const list = activeList();
+  const inList = (f) => list.items.some((x) => x.key === f.key);
+  const found = j?.found || [];
+  const pending = found.filter((f) => !inList(f));
+  const selN = pending.filter((f) => S.scanSel.has(f.key)).length;
+  for (const f of found) {
+    const already = inList(f);
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = already || S.scanSel.has(f.key); cb.disabled = already;
+    cb.onchange = () => { cb.checked ? S.scanSel.add(f.key) : S.scanSel.delete(f.key); renderScan(); };
+    const meta = [f.lang, audioLabel(f.audio), f.country, f.res, f.live === false ? "grabado" : "en vivo", f.car ? (f.car.ok ? "Apto CarTV" : "") : "Probado en el iPhone",
+      f.needs === "referer" ? "necesita Referer" : "", f.lock ? "solo esta red" : "", f.geo ? "puede tener bloqueo por país" : "", already ? `ya está en «${list.name}»` : ""].filter(Boolean).join(" · ");
+    nodes.push(el("label", { class: "scanrow" + (already ? " saved" : "") }, cb, logoEl(f.logo),
+      el("div", { class: "t" }, el("b", {}, f.name), el("div", { class: "meta" }, meta), el("div", { class: "u" }, f.url))));
+  }
+  if (found.length) nodes.push(el("div", { class: "scanbar" },
+    el("button", { class: "btn", type: "button", onclick: () => { if (selN === pending.length) S.scanSel.clear(); else pending.forEach((f) => S.scanSel.add(f.key)); renderScan(); } },
+      icon("check"), selN === pending.length && pending.length ? "Quitar todos" : "Marcar todos"),
+    el("button", { class: "btn primary", type: "button", disabled: !selN, onclick: () => addManySheet(pending.filter((f) => S.scanSel.has(f.key))) }, icon("plus"), `Agregar ${selN}`)));
+  put(out, nodes);
+}
+function addManySheet(items) {
+  if (!items.length) return;
+  const state = { listId: S.active, group: "" };
+  const doAdd = () => {
+    const list = S.lists.find((l) => l.id === state.listId);
+    let n = 0;
+    for (const f of items) {
+      if (list.items.some((x) => x.key === f.key)) continue;
+      list.items.push({ id: uid(), car: f.car || undefined, tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "", ua: f.ua || "",
+        group: state.group, live: f.live, res: f.res || "", verifiedAt: f.verifiedAt || 0, status: f.verifiedAt ? "ok" : "" });
+      n++;
+    }
+    S.active = list.id;
+    touch(list);
+    S.scanSel.clear();
+    closeSheet();
+    toast(`${n} canal(es) agregado(s) a «${list.name}»${state.group ? " · " + state.group : ""}`);
+    renderHeader(); renderScan();
+  };
+  sheet(`Agregar ${items.length} canal(es)`, [pickTarget(state)],
+    [el("button", { class: "btn", onclick: closeSheet }, "Cancelar"), el("button", { class: "btn primary", onclick: doAdd }, "Agregar")]);
 }
 
 // ---------- hoja inferior ----------
@@ -805,7 +1032,7 @@ function addSheet(f) {
   const doAdd = () => {
     const list = S.lists.find((l) => l.id === state.listId);
     if (list.items.some((x) => x.key === f.key)) { toast("Ya está en esa lista"); return; }
-    list.items.push({ id: uid(), car: f.car || undefined, tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "",
+    list.items.push({ id: uid(), car: f.car || undefined, tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "", ua: f.ua || "",
       group: state.group, live: f.live, res: f.res || "", verifiedAt: f.verifiedAt || 0, status: f.verifiedAt ? "ok" : "" });
     S.active = list.id;
     touch(list);
@@ -1131,18 +1358,26 @@ function renderSettings() {
     el("div", { class: "set" }, el("h3", {}, icon("search"), "Búsqueda"),
       el("label", {}, "Links a probar en cada búsqueda"),
       (() => {
-        const n = el("input", { class: "field", type: "number", min: "1", step: "1", inputmode: "numeric", value: String(goalOf()), style: "width:90px" });
-        const ok = el("span", { class: "hint", style: "margin:0" }, "");
-        const put = () => {
-          const v = searchCountOf(n.value);
+        const txt = (v) => (v ? `${v} links` : "todos los links");
+        const n = el("input", { class: "field", type: "number", min: "0", step: "1", inputmode: "numeric", value: String(goalOf()), style: "width:90px" });
+        const ok = el("span", { class: "hint", style: "margin:0" }, `Ahora: ${txt(goalOf())}`);
+        const put = (v) => {
+          v = searchCountOf(v);
           n.value = String(v); S.settings.searchCount = v; save({ republish: false });
-          ok.textContent = store.get("m3u.settings", {}).searchCount === v ? `✓ Guardado: ${v} links` : "No se pudo guardar";
-          toast(`Guardado: ${v} links por búsqueda`);
+          ok.textContent = store.get("m3u.settings", {}).searchCount === v ? `✓ Guardado: ${txt(v)}` : "No se pudo guardar";
+          toast(`Guardado: ${txt(v)} por búsqueda`);
         };
-        n.onchange = put; n.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); n.blur(); } };
-        return el("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" }, n, el("button", { class: "btn primary", onclick: put }, icon("check"), "Guardar"), ok);
+        n.onchange = () => put(n.value); n.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); n.blur(); } };
+        return el("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" }, n,
+          el("button", { class: "btn primary", onclick: () => put(n.value) }, icon("check"), "Guardar"),
+          el("button", { class: "btn", onclick: () => put(0) }, "Todos"), ok);
       })(),
-      el("p", { class: "hint" }, "Prueba exactamente esa cantidad, uno por uno y en orden: directorio (aquí en el iPhone) → sitio oficial → web (con tu computador, porque Safari no puede abrir otras páginas por detrás). No se detiene aunque alguno ya funcione. Sin límite.")),
+      el("p", { class: "hint" }, "0 o «Todos» = no omite ningún link: prueba TODO lo que aparezca, uno por uno y en orden: directorio (aquí en el iPhone) → todos los sitios oficiales y todas sus páginas → todos los resultados de la web (con tu computador, porque Safari no puede abrir otras páginas por detrás). Con un número, prueba exactamente esa cantidad.")),
+    el("div", { class: "set" }, el("h3", {}, icon("cast"), "Solo lo que abra en CarTV con datos"),
+      el("label", { style: "display:flex;gap:10px;align-items:center;text-transform:none;letter-spacing:0;font:inherit;color:var(--text)" },
+        (() => { const c = el("input", { type: "checkbox", checked: portableOn(), style: "width:22px;height:22px" }); c.onchange = () => { S.settings.portableOnly = c.checked; save({ republish: false }); toast(c.checked ? "Solo se mostrarán links que abren en este celular" : "Se mostrará todo"); }; return c; })(),
+        "Descartar links que en CarTV no abrirían fuera de tu casa"),
+      el("p", { class: "hint" }, "Descarta los links amarrados a la red del computador (con datos no abren) y los que vencen pronto sin poder renovarse. Lo que decide si un link sirve es la prueba «como CarTV» que hace tu computador, no Safari.")),
     el("div", { class: "set" }, el("h3", {}, "Formato de las listas"), el("label", {}, "Cómo van el Referer y el User-Agent"), fmt),
     el("div", { class: "set" }, el("h3", {}, "Link fijo (GitHub)"),
       el("p", { class: "hint" }, "Publica cada lista como un Gist secreto de GitHub (gratis). El link no cambia aunque edites la lista."),
@@ -1197,7 +1432,7 @@ function setView(v) {
   renderHeader();
   scrollTo(0, 0);
 }
-function renderAll() { renderHeader(); renderSearch(); if (S.view === "vLists") renderLists(); if (S.view === "vSettings") renderSettings(); }
+function renderAll() { renderHeader(); renderSearchMode(); renderSearch(); if (S.view === "vLists") renderLists(); if (S.view === "vSettings") renderSettings(); }
 document.querySelectorAll("nav.tabs button").forEach((b) => (b.onclick = () => setView(b.dataset.view)));
 $("#activePill").onclick = () => setView("vLists");
 $("#pageForm").onsubmit = (e) => {

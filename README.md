@@ -40,6 +40,10 @@ Safari → abre el link → Compartir (cuadro con flecha) → **Añadir a pantal
 - Requisitos: el mismo usuario de GitHub en la app (Ajustes) y en la extensión (lista publicada), y el computador
   prendido con Chrome abierto. La extensión revisa encargos cada 30 segundos.
 
+## Idioma y escaneo global
+- Arriba en 🔎 Buscar: selector de **idioma** (español latino por defecto), **Países** (uno o varios, o toda Latinoamérica) y **Escaneo global** (categoría y cantidad).
+  El escaneo se puede hacer con tu computador (más rápido, prueba como CarTV) o aquí en el iPhone; marcas los que quieras y «Agregar».
+
 ## Límites de una app web (no los tiene la extensión de Chrome)
 - Por sí sola no puede abrir otras páginas por detrás: para eso usa el puente con la extensión.
 - No puede probar links que exigen Referer (Safari no deja cambiarlo): se descartan en la búsqueda.

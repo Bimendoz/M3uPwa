@@ -1,6 +1,6 @@
 // Service worker: la app abre sin conexión y el directorio de canales queda en caché.
-const VERSION = "listas-m3u-v14";
-const SHELL = ["./", "index.html", "app.js", "icons.js", "hls.min.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png"];
+const VERSION = "listas-m3u-v20";
+const SHELL = ["./", "index.html", "app.js", "icons.js", "lang.js", "hls.min.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png"];
 const DIR = "https://iptv-org.github.io/api/";
 
 self.addEventListener("install", (e) => {
