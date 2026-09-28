@@ -234,7 +234,7 @@ async function relayJob(payload, job, my) {
 async function addPcResults(found, job, my) {
   for (const f of found) {
     if (my !== searchToken || job.found.some((x) => x.key === keyOf(f.url))) continue;
-    const item = { url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
+    const item = { tier: f.tier || sourceInfo(f.url, { pageUrl: f.pageUrl }).tier, tierWhy: f.tierWhy || [], url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
       live: f.live, res: f.res ? String(f.res).split("x").pop() + "p" : "", verifiedAt: f.verifiedAt || Date.now(), lock: networkLock(f.url), exp: tokenExpiry(f.url), viaPc: true };
     if (f.needs === "referer") item.note = "Probado por tu computador (necesita Referer: Safari no puede probarlo)";
     else {
@@ -245,6 +245,47 @@ async function addPcResults(found, job, my) {
     job.found.push(item); renderSearch();
   }
 }
+
+// ---------- ¿de dónde viene el link? (mismo código en la extensión y en la PWA) ----------
+// official  -> sale de la página del canal o de su mismo dominio
+// cdn       -> plataforma profesional de video (Mediastream, Akamai, CloudFront, Wowza…): casi siempre la del canal
+// unofficial-> IP suelta, puerto raro, DNS casero o panel IPTV de terceros: suele caerse o bloquear
+// unknown   -> no se puede saber
+const PRO_CDN = /(^|\.)(mdstrm\.com|mediastre\.am|akamaized\.net|akamaihd\.net|akamai\.net|cloudfront\.net|fastly\.net|fastlylb\.net|llnwd\.net|llnwi\.net|edgecastcdn\.net|azureedge\.net|streamlock\.net|wowza\.com|bcovlive\.io|brightcove\.(com|net)|jwpcdn\.com|jwplayer\.com|dailymotion\.com|dmcdn\.net|ttvnw\.net|cdn77\.org|cdnvideo\.ru|vimeocdn\.com|amagi\.tv|cloudflarestream\.com|videodelivery\.net|mediapackage\.[\w-]+\.amazonaws\.com|mediatailor\.[\w-]+\.amazonaws\.com|zype\.com|castr\.(io|com)|hlsliveamdgl|googlevideo\.com|youtube\.com|livestream\.com|ustream\.tv|kaltura\.com|vhx\.tv|lldns\.net|footprint\.net|level3\.net|limelight\.com|b-cdn\.net|bunnycdn\.com|gcdn\.co|streamhoster\.com|tulix\.tv|streann\.com|mux\.com|dacast\.com|boxcast\.io|ottera\.tv)$/i;
+const HOME_DNS = /(^|\.)(ddns\.net|duckdns\.org|no-ip\.(com|org|biz|info)|noip\.me|myftp\.(org|biz)|hopto\.org|zapto\.org|sytes\.net|servehttp\.com|serveftp\.com|dyndns\.(org|info|tv)|dynu\.net|freeddns\.org|ddnsking\.com|3utilities\.com|mooo\.com)$/i;
+function isIpHost(h) { return /^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(":") || /^\[/.test(h); }
+function baseDomain(host) {
+  host = (host || "").toLowerCase().replace(/^www\./, "");
+  if (!host || isIpHost(host)) return host;
+  const p = host.split(".");
+  if (p.length > 2 && p[p.length - 1].length === 2 && /^(com|gov|gob|net|org|edu|co|ac|mil|tv)$/.test(p[p.length - 2])) return p.slice(-3).join(".");
+  return p.slice(-2).join(".");
+}
+function sourceInfo(url, ctx = {}) {
+  let u; try { u = new URL(url); } catch { return { tier: "unknown", why: ["link inválido"] }; }
+  const host = u.hostname.replace(/^\[|\]$/g, ""), why = [];
+  const dom = (x) => { try { return baseDomain(new URL(x).hostname); } catch { return ""; } };
+  const sameOfficial = !!ctx.website && dom(ctx.website) === baseDomain(host);
+  const samePage = !!ctx.pageUrl && dom(ctx.pageUrl) === baseDomain(host);
+  const sameSite = sameOfficial || samePage;
+  const port = u.port && !["80", "443"].includes(u.port) ? u.port : "";
+  const xtream = /\/(live|movie|series)\/[^/]+\/[^/]+\/\d+(\.\w+)?$/i.test(u.pathname) || /\/get\.php$/i.test(u.pathname) || /[?&](username|password)=/i.test(u.search);
+  if (isIpHost(host)) why.push("servidor sin dominio, solo una dirección IP");
+  if (port) why.push(`puerto no estándar (${port})`);
+  if (HOME_DNS.test(host)) why.push("dominio de IP dinámica (servidor casero)");
+  if (xtream) why.push("formato de panel IPTV de terceros");
+  if (u.protocol === "http:") why.push("sin cifrar (http)");
+  const bad = isIpHost(host) || HOME_DNS.test(host) || xtream || (port && !sameSite);
+  if (sameOfficial && !bad) return { tier: "official", why: ["mismo dominio que la página oficial del canal"] };
+  if (ctx.fromOfficialPage && !bad) return { tier: "official", why: ["lo pide el reproductor de la página oficial del canal"] };
+  if (samePage && !bad) return { tier: "page", why: ["del mismo sitio donde lo encontraste (" + baseDomain(host) + "); no se sabe si es el oficial del canal"] };
+  if (bad) return { tier: "unofficial", why };
+  if (PRO_CDN.test(host)) return { tier: "cdn", why: ["plataforma profesional de video (" + baseDomain(host) + ")"] };
+  return { tier: "unknown", why: why.length ? why : ["dominio " + baseDomain(host) + " (no se puede confirmar si es del canal)"] };
+}
+const TIER_LABEL = { official: "Oficial", cdn: "Plataforma", page: "De la página", unknown: "Sin confirmar", unofficial: "No oficial" };
+const TIER_RANK = { official: 0, cdn: 1, page: 2, unknown: 3, unofficial: 4 };
+const tierOf = (item) => (item.tier ? { tier: item.tier, why: item.tierWhy || [] } : sourceInfo(item.url, { pageUrl: item.pageUrl }));
 
 // ---------- directorio de canales (iptv-org, caché 24 h) ----------
 const DIR = "https://iptv-org.github.io/api/";
@@ -366,7 +407,7 @@ function verifyVideo(url, ms = 16000) {
 }
 
 // ---------- búsqueda ----------
-const MAX_FOUND = 3, MAX_TESTS = 16;
+const MAX_FOUND = 10, MAX_TESTS = 20; // se prueban todos y se muestran los que funcionan
 let searchToken = 0;
 async function runSearch(query) {
   query = cleanTitle(query);
@@ -398,9 +439,10 @@ async function runSearch(query) {
         seen.add(k);
         job.tried++; renderSearch();
         try {
-          const r = await verifyVideo(c.url);
+          const r = await verifyVideo(c.url, 12000);
           if (my !== searchToken) return;
-          job.found.push({ ...c, key: k, live: r.live, res: r.h ? r.h + "p" : r.audioOnly ? "solo audio" : "", verifiedAt: Date.now(), lock: networkLock(c.url), exp: tokenExpiry(c.url) });
+          const si = sourceInfo(c.url, { website: c.website });
+          job.found.push({ ...c, tier: si.tier, tierWhy: si.why, key: k, live: r.live, res: r.h ? r.h + "p" : r.audioOnly ? "solo audio" : "", verifiedAt: Date.now(), lock: networkLock(c.url), exp: tokenExpiry(c.url) });
         } catch (e) {
           job.failed.push({ host: hostOf(c.url), why: (c.referer ? "necesita Referer (no se puede probar en Safari) · " : "") + e.message });
         }
@@ -408,12 +450,16 @@ async function runSearch(query) {
       }
     }));
     if (my !== searchToken) return;
-    if (!job.found.length && S.settings.ghToken) {
+    const hasGood = job.found.some((f) => f.tier === "official" || (f.tier === "cdn" && !needsPlayerSession(f.url)));
+    if (!hasGood && S.settings.ghToken) {
+      job.step = job.found.length ? "Ninguno es oficial: pidiéndole a tu computador el link de la página oficial…" : job.step;
       await addPcResults(await relayJob({ query }, job, my), job, my);
       if (my !== searchToken) return;
-      job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) con ayuda de tu computador.` : job.step;
+      job.found.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3));
+      job.step = job.found.length ? `${job.found.length} link(s) funcionan (con ayuda de tu computador).` : job.step;
       return;
     }
+    job.found.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3));
     job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : `Probé ${job.tried} link(s) y ninguno funcionó.`;
   } catch (e) {
     if (my !== searchToken) return;
@@ -436,7 +482,7 @@ async function runPage(pageUrl) {
       for (const u of urls) {
         if (my !== searchToken || job.found.length >= MAX_FOUND) break;
         job.tried++; job.step = `Probando ${hostOf(u)}…`; renderSearch();
-        try { const r = await verifyVideo(u); job.found.push({ url: u, name: title, key: keyOf(u), live: r.live, res: r.h ? r.h + "p" : "", verifiedAt: Date.now(), lock: networkLock(u), exp: tokenExpiry(u), referer: "" }); }
+        try { const r = await verifyVideo(u); const si = sourceInfo(u, { pageUrl }); job.found.push({ tier: si.tier, tierWhy: si.why, url: u, name: title, key: keyOf(u), live: r.live, res: r.h ? r.h + "p" : "", verifiedAt: Date.now(), lock: networkLock(u), exp: tokenExpiry(u), referer: "" }); }
         catch (e) { job.failed.push({ host: hostOf(u), why: e.message }); }
       }
     } else job.failed.push({ host: hostOf(pageUrl), why: "Safari no deja leer esa página desde otra web (normal)" });
@@ -490,18 +536,24 @@ function renderSearch() {
     el("div", { class: "meta" }, `${j.tried} probado(s) · ${j.found.length} verificado(s) · ${j.failed.length} descartado(s)`));
   if (j.failed.length) st.append(el("details", {}, el("summary", {}, "Ver por qué se descartaron"), el("ul", {}, j.failed.slice(-15).map((f) => el("li", {}, `${f.host}: ${f.why}`)))));
   out.append(st);
+  if (j.found.length) {
+    const c = {}; j.found.forEach((f) => { const t = tierOf(f).tier; c[t] = (c[t] || 0) + 1; });
+    out.append(el("p", { class: "hint" }, "Funcionan: " + ["official", "cdn", "page", "unknown", "unofficial"].filter((t) => c[t]).map((t) => `${c[t]} ${TIER_LABEL[t].toLowerCase()}`).join(" · ") + ". Tú eliges cuáles agregar."));
+  }
   if (!j.running && !j.found.length && !j.pageUrl && !j.viaPc) {
     out.append(el("p", { class: "hint" }, "Prueba con otro nombre (sin «canal» ni «TV»), pega arriba el link de la página donde lo ves, o pídele a tu computador que lo busque en la web y en su página oficial:"),
       el("button", { class: "btn", style: "width:100%", onclick: () => (S.settings.ghToken ? runPcSearch(j.query) : (toast("Conecta GitHub en Ajustes"), setView("vSettings"))) }, icon("laptop"), "Buscar con mi computador"));
     for (const s of j.sites) out.append(el("a", { class: "btn sm", href: s, target: "_blank", rel: "noopener", style: "display:inline-block;margin:4px 6px 0 0;text-decoration:none" }, "Abrir " + hostOf(s)));
   }
   for (const f of j.found) {
+    const ti = tierOf(f);
     const info = [f.warn ? "Verificado solo en tu computador" : "Verificado", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
     const weak = needsPlayerSession(f.url);
     const notes = [f.note || "", weak ? "Link sin la sesión del reproductor: puede fallar en CarTV. Mejor sácalo de la página oficial." : "", f.lock ? `Solo funciona en la red donde lo probaste (${f.lock === "ip" ? "tu IP" : "tu proveedor"})` : "", f.exp ? `Vence ${new Date(f.exp).toLocaleString()}` : ""].filter(Boolean);
     out.append(el("div", { class: "card " + (f.warn || weak ? "st-warn" : "st-ok") },
-      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("b", {}, f.name), el("div", { class: "meta tag " + (f.warn ? "warn" : "ok") }, icon(f.warn ? "alert" : "check", 12), info), notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
+      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("span", { class: "tier t-" + ti.tier, title: ti.why.join(" · ") }, TIER_LABEL[ti.tier]), el("b", {}, f.name), el("div", { class: "meta tag " + (f.warn ? "warn" : "ok") }, icon(f.warn ? "alert" : "check", 12), info), notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
       el("div", { class: "meta", style: "margin-top:6px" }, f.url),
+      ti.tier === "unofficial" || ti.tier === "unknown" ? el("div", { class: "meta " + (ti.tier === "unofficial" ? "warn" : ""), style: "margin-top:4px" }, ti.why.join(" · ")) : null,
       el("div", { class: "acts" },
         el("button", { class: "btn primary", onclick: () => addSheet(f) }, icon("plus"), "Agregar a lista"),
         el("button", { class: "btn icon", title: "Ver", onclick: () => play(f) }, icon("play")),
@@ -553,7 +605,7 @@ function addSheet(f) {
   const doAdd = () => {
     const list = S.lists.find((l) => l.id === state.listId);
     if (list.items.some((x) => x.key === f.key)) { toast("Ya está en esa lista"); return; }
-    list.items.push({ id: uid(), key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "",
+    list.items.push({ id: uid(), tier: tierOf(f).tier, tierWhy: tierOf(f).why, key: f.key, name: cleanTitle(name.value) || f.name, url: f.url, referer: f.referer || "", logo: f.logo || "", tvgId: f.tvgId || "",
       group: state.group, live: f.live, res: f.res || "", verifiedAt: f.verifiedAt || 0, status: f.verifiedAt ? "ok" : "" });
     S.active = list.id;
     touch(list);
@@ -627,7 +679,7 @@ function itemCard(list, it) {
   const exp = tokenExpiry(it.url);
   return el("div", { class: "card" + (it.status ? " st-" + (it.status === "testing" ? "warn" : it.status) : "") },
     el("div", { class: "ch" }, logoEl(it.logo),
-      el("div", { class: "t" }, el("b", {}, it.name),
+      el("div", { class: "t" }, el("span", { class: "tier t-" + tierOf(it).tier, title: tierOf(it).why.join(" · ") }, TIER_LABEL[tierOf(it).tier]), el("b", {}, it.name),
         el("div", { class: "meta" }, st, it.verifiedAt ? ` · ${ago(it.verifiedAt)}` : "", it.res ? ` · ${it.res}` : "", it.why && it.status === "bad" ? ` · ${it.why}` : ""),
         exp || networkLock(it.url) ? el("div", { class: "meta warn" }, [networkLock(it.url) ? "Amarrado a la red" : "", exp ? (exp < Date.now() ? "Token vencido" : `Vence ${new Date(exp).toLocaleString()}`) : ""].filter(Boolean).join(" · ")) : null),
       el("button", { class: "btn icon", title: "Ver", onclick: () => play(it) }, icon("play")),
