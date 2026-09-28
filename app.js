@@ -222,7 +222,7 @@ async function relayJob(payload, job, my) {
     }
     if (!acked && Date.now() - t0 > 100000) {
       ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`req-${rid}.json`]: null } }) }).catch(() => {});
-      throw new Error("Tu computador no respondió. Revisa que esté prendido con Chrome abierto, y que la extensión esté conectada al mismo GitHub (Opciones → Puente con la app del iPhone).");
+      throw new Error("Tu computador no respondió. Revisa que esté prendido con Chrome abierto, y que la extensión esté conectada al mismo GitHub (Opciones, «Puente con la app del iPhone»).");
     }
     if (acked && Date.now() - t0 > 5 * 60e3) throw new Error("Tu computador tardó demasiado. Intenta de nuevo.");
   }
@@ -238,7 +238,7 @@ async function addPcResults(found, job, my) {
     else {
       job.step = `Probando aquí ${hostOf(f.url)}…`; renderSearch();
       try { const r = await verifyVideo(f.url); item.res = r.h ? r.h + "p" : item.res; item.note = "Probado por tu computador y en este equipo"; }
-      catch (e) { item.note = `⚠ Funciona en tu computador pero aquí no: ${e.message}`; item.warn = true; }
+      catch (e) { item.note = `Funciona en tu computador pero aquí no: ${e.message}`; item.warn = true; }
     }
     job.found.push(item); renderSearch();
   }
@@ -264,6 +264,8 @@ async function dirJson(name) {
     throw e;
   }
 }
+// Servicios que solo entregan el directo con la sesión de su reproductor: el link del directorio suele fallar en CarTV
+const needsPlayerSession = (url) => { try { const u = new URL(url); return /(^|\.)(mdstrm\.com|mediastream\.[a-z.]+)$/i.test(u.hostname) && !u.searchParams.has("player"); } catch { return false; } };
 const STOP = new Set(["canal", "tv", "television", "hd", "channel", "en", "vivo", "el", "la", "de", "del", "y", "senal", "live"]);
 const norm = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const words = (s) => norm(s).split(" ").filter((w) => w && !STOP.has(w));
@@ -424,7 +426,7 @@ async function runPage(pageUrl) {
     } else job.failed.push({ host: hostOf(pageUrl), why: "Safari no deja leer esa página desde otra web (normal)" });
     // 2) con el computador: abre la página en Chrome, le da play y captura lo que pide el reproductor
     if (!job.found.length && my === searchToken) {
-      if (!S.settings.ghToken) { job.step = "Aquí no encontré el video. Para sacarlo con tu computador, conecta en ⚙️ Ajustes el mismo GitHub de la extensión."; return; }
+      if (!S.settings.ghToken) { job.step = "Aquí no encontré el video. Para sacarlo con tu computador, conecta en Ajustes el mismo GitHub de la extensión."; return; }
       await addPcResults(await relayJob({ pageUrl }, job, my), job, my);
     }
     if (my !== searchToken) return;
@@ -450,15 +452,16 @@ function stopSearch() {
 }
 
 function logoEl(src) {
-  if (!src) return el("div", { class: "logo" }, "▶");
+  if (!src) return el("div", { class: "logo" }, icon("tv", 20));
   const img = el("img", { class: "logo", src, alt: "", loading: "lazy", referrerPolicy: "no-referrer" });
-  img.onerror = () => img.replaceWith(el("div", { class: "logo" }, "▶"));
+  img.onerror = () => img.replaceWith(el("div", { class: "logo" }, icon("tv", 20)));
   return img;
 }
 function renderSearch() {
   const out = $("#searchOut");
   const j = S.search;
-  $("#btnSearch").textContent = j?.running ? "Detener" : "Buscar";
+  $("#btnSearch").replaceChildren(icon(j?.running ? "x" : "search", 20));
+  $("#btnSearch").setAttribute("aria-label", j?.running ? "Detener" : "Buscar");
   $("#btnSearch").classList.toggle("primary", !j?.running);
   $("#btnPage").disabled = !!j?.running;
   out.replaceChildren();
@@ -473,19 +476,21 @@ function renderSearch() {
   out.append(st);
   if (!j.running && !j.found.length && !j.pageUrl && !j.viaPc) {
     out.append(el("p", { class: "hint" }, "Prueba con otro nombre (sin «canal» ni «TV»), pega arriba el link de la página donde lo ves, o pídele a tu computador que lo busque en la web y en su página oficial:"),
-      el("button", { class: "btn", style: "width:100%", onclick: () => (S.settings.ghToken ? runPcSearch(j.query) : (toast("Conecta GitHub en Ajustes"), setView("vSettings"))) }, "🖥 Buscar con mi computador"));
+      el("button", { class: "btn", style: "width:100%", onclick: () => (S.settings.ghToken ? runPcSearch(j.query) : (toast("Conecta GitHub en Ajustes"), setView("vSettings"))) }, icon("laptop"), "Buscar con mi computador"));
     for (const s of j.sites) out.append(el("a", { class: "btn sm", href: s, target: "_blank", rel: "noopener", style: "display:inline-block;margin:4px 6px 0 0;text-decoration:none" }, "Abrir " + hostOf(s)));
   }
   for (const f of j.found) {
-    const info = [f.warn ? "⚠ Verificado solo en tu computador" : "✔ Verificado", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
-    const notes = [f.note || "", f.lock ? `🔒 Solo funciona en la red donde lo probaste (${f.lock === "ip" ? "tu IP" : "tu proveedor"})` : "", f.exp ? `⏱ vence ${new Date(f.exp).toLocaleString()}` : ""].filter(Boolean);
-    out.append(el("div", { class: "card" },
-      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("b", {}, f.name), el("div", { class: "meta " + (f.warn ? "warn" : "ok") }, info), notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
+    const info = [f.warn ? "Verificado solo en tu computador" : "Verificado", f.res, f.live === false ? "grabado" : "en vivo"].filter(Boolean).join(" · ");
+    const weak = needsPlayerSession(f.url);
+    const notes = [f.note || "", weak ? "Link sin la sesión del reproductor: puede fallar en CarTV. Mejor sácalo de la página oficial." : "", f.lock ? `Solo funciona en la red donde lo probaste (${f.lock === "ip" ? "tu IP" : "tu proveedor"})` : "", f.exp ? `Vence ${new Date(f.exp).toLocaleString()}` : ""].filter(Boolean);
+    out.append(el("div", { class: "card " + (f.warn || weak ? "st-warn" : "st-ok") },
+      el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("b", {}, f.name), el("div", { class: "meta tag " + (f.warn ? "warn" : "ok") }, icon(f.warn ? "alert" : "check", 12), info), notes.length ? el("div", { class: "meta warn" }, notes.join(" · ")) : null)),
       el("div", { class: "meta", style: "margin-top:6px" }, f.url),
       el("div", { class: "acts" },
-        el("button", { class: "btn primary", onclick: () => addSheet(f) }, "＋ Agregar a lista"),
-        el("button", { class: "btn icon", title: "Ver", onclick: () => play(f) }, "▶"),
-        el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, "⧉"))));
+        el("button", { class: "btn primary", onclick: () => addSheet(f) }, icon("plus"), "Agregar a lista"),
+        el("button", { class: "btn icon", title: "Ver", onclick: () => play(f) }, icon("play")),
+        el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, icon("copy"))),
+      weak && f.website ? el("button", { class: "btn", style: "width:100%;margin-top:8px", onclick: () => runPage(f.website) }, icon("laptop"), `Sacar link completo de ${hostOf(f.website)}`) : null));
   }
 }
 
@@ -515,12 +520,12 @@ function pickTarget(state) {
     box.replaceChildren(
       el("label", {}, "Lista"),
       el("div", { class: "chips" }, S.lists.map((l) => el("button", { class: "chip" + (l.id === list.id ? " on" : ""), type: "button", onclick: () => { state.listId = l.id; state.group = ""; draw(); } }, l.name)),
-        el("button", { class: "chip add", type: "button", onclick: () => { const n = prompt("Nombre de la nueva lista"); if (n && cleanTitle(n)) { const nl = { id: uid(), name: cleanTitle(n), categories: [], items: [] }; S.lists.push(nl); save({ republish: false }); state.listId = nl.id; draw(); } } }, "＋ Nueva lista")),
+        el("button", { class: "chip add", type: "button", onclick: () => { const n = prompt("Nombre de la nueva lista"); if (n && cleanTitle(n)) { const nl = { id: uid(), name: cleanTitle(n), categories: [], items: [] }; S.lists.push(nl); save({ republish: false }); state.listId = nl.id; draw(); } } }, icon("plus", 14), "Nueva lista")),
       el("label", {}, "Categoría"),
       el("div", { class: "chips" },
         el("button", { class: "chip" + (!state.group ? " on" : ""), type: "button", onclick: () => { state.group = ""; draw(); } }, "Automática"),
         list.categories.map((c) => el("button", { class: "chip" + (state.group === c ? " on" : ""), type: "button", onclick: () => { state.group = c; draw(); } }, c)),
-        el("button", { class: "chip add", type: "button", onclick: () => { const n = cleanTitle(prompt("Nombre de la nueva categoría") || "").slice(0, 40); if (n) { if (!list.categories.includes(n)) list.categories.push(n); state.group = n; save({ republish: false }); draw(); } } }, "＋ Categoría")));
+        el("button", { class: "chip add", type: "button", onclick: () => { const n = cleanTitle(prompt("Nombre de la nueva categoría") || "").slice(0, 40); if (n) { if (!list.categories.includes(n)) list.categories.push(n); state.group = n; save({ republish: false }); draw(); } } }, icon("plus", 14), "Categoría")));
   };
   draw();
   return box;
@@ -555,11 +560,11 @@ function play(it) {
   syncViewport();
   try { playerHls?.destroy(); } catch {}
   playerHls = null;
-  v.onerror = () => ($("#playerMsg").textContent = "✖ " + mediaError(v));
-  v.onplaying = () => ($("#playerMsg").textContent = `▶ ${v.videoHeight ? v.videoHeight + "p · " : ""}${hostOf(it.url)}`);
+  v.onerror = () => ($("#playerMsg").textContent = "Error: " + mediaError(v));
+  v.onplaying = () => ($("#playerMsg").textContent = `EN VIVO · ${v.videoHeight ? v.videoHeight + "p · " : ""}${hostOf(it.url)}`);
   if (NATIVE_HLS) v.src = it.url;
-  else if (window.Hls?.isSupported()) { playerHls = new Hls(); playerHls.on(Hls.Events.ERROR, (_e, d) => { if (d.fatal) $("#playerMsg").textContent = "✖ " + (d.response?.code ? "el servidor respondió " + d.response.code : d.details); }); playerHls.loadSource(it.url); playerHls.attachMedia(v); }
-  v.play().catch(() => ($("#playerMsg").textContent = "Toca ▶ para reproducir"));
+  else if (window.Hls?.isSupported()) { playerHls = new Hls(); playerHls.on(Hls.Events.ERROR, (_e, d) => { if (d.fatal) $("#playerMsg").textContent = "Error: " + (d.response?.code ? "el servidor respondió " + d.response.code : d.details); }); playerHls.loadSource(it.url); playerHls.attachMedia(v); }
+  v.play().catch(() => ($("#playerMsg").textContent = "Toca reproducir"));
 }
 $("#playerClose").onclick = () => {
   const v = $("#playerVideo");
@@ -578,38 +583,39 @@ function renderLists() {
 
   put(view,
     el("div", { class: "chips" }, S.lists.map((l) => el("button", { class: "chip" + (l.id === list.id ? " on" : ""), onclick: () => { S.active = l.id; S.listCat = "*"; save({ republish: false }); renderLists(); renderHeader(); } }, `${l.name} · ${l.items.length}`)),
-      el("button", { class: "chip add", onclick: newList }, "＋ Nueva lista")),
-    el("div", { class: "listhead" }, el("b", {}, list.name), el("button", { class: "btn sm", onclick: () => listMenu(list) }, "⋯ Lista")),
+      el("button", { class: "chip add", onclick: newList }, icon("plus", 14), "Nueva lista")),
+    el("div", { class: "listhead" }, el("b", {}, list.name), el("button", { class: "btn sm", onclick: () => listMenu(list) }, icon("more"), "Lista")),
     el("div", { class: "acts", style: "margin-top:4px" },
-      el("button", { class: "btn primary", onclick: () => exportSheet(list), disabled: !list.items.length }, "⇪ Exportar"),
-      el("button", { class: "btn", onclick: () => manualSheet(list) }, "＋ Link")),
-    list.link ? el("div", { class: "meta", style: "margin-top:8px" }, "🔗 Link fijo publicado: se actualiza solo al cambiar la lista.") : null,
+      el("button", { class: "btn primary", onclick: () => exportSheet(list), disabled: !list.items.length }, icon("share"), "Exportar"),
+      el("button", { class: "btn", onclick: () => manualSheet(list) }, icon("plus"), "Link")),
+    list.link ? el("div", { class: "meta tag", style: "margin-top:8px" }, icon("link", 12), "Link fijo publicado: se actualiza solo al cambiar la lista.") : null,
     groups.size ? el("div", { class: "chips", style: "margin-top:12px" },
       el("button", { class: "chip" + (S.listCat === "*" ? " on" : ""), onclick: () => { S.listCat = "*"; renderLists(); } }, "Todas"),
       [...groups.keys()].map((g) => el("button", { class: "chip" + (S.listCat === g ? " on" : ""), onclick: () => { S.listCat = g; renderLists(); } }, `${g} · ${groups.get(g).length}`)),
-      el("button", { class: "chip add", onclick: () => { const n = cleanTitle(prompt("Nombre de la nueva categoría") || "").slice(0, 40); if (n && !list.categories.includes(n)) { list.categories.push(n); touch(list); renderLists(); } } }, "＋ Categoría")) : null
+      el("button", { class: "chip add", onclick: () => { const n = cleanTitle(prompt("Nombre de la nueva categoría") || "").slice(0, 40); if (n && !list.categories.includes(n)) { list.categories.push(n); touch(list); renderLists(); } } }, icon("plus", 14), "Categoría")) : null
   );
-  if (!list.items.length) view.append(el("p", { class: "empty" }, "Esta lista está vacía. Busca un canal en 🔎 Buscar y agrégalo, agrega un link con «＋ Link» o importa un .m3u desde «⋯ Lista»."));
+  if (!list.items.length) view.append(el("p", { class: "empty" }, "Esta lista está vacía. Busca un canal en Buscar y agrégalo, agrega un link con «Link» o importa un .m3u desde el menú «Lista»."));
   for (const [g, items] of groups) {
     if (S.listCat !== "*" && S.listCat !== g) continue;
     const isUser = list.categories.includes(g);
     view.append(el("h2", {}, g, el("span", { class: "n" }, items.length), isUser ? null : el("span", { style: "font-weight:400;text-transform:none;letter-spacing:0" }, "automática"),
       isUser ? el("span", { class: "grow" }) : null,
-      isUser ? el("button", { class: "btn sm", style: "text-transform:none;letter-spacing:0", onclick: () => catMenu(list, g) }, "⋯") : null));
-    if (!items.length) view.append(el("p", { class: "hint" }, "Vacía. Envía canales aquí con ⋯ → Mover a categoría."));
+      isUser ? el("button", { class: "btn sm", style: "text-transform:none;letter-spacing:0", onclick: () => catMenu(list, g) }, icon("more")) : null));
+    if (!items.length) view.append(el("p", { class: "hint" }, "Vacía. Envía canales aquí desde el menú de cada canal, «Mover a categoría»."));
     for (const it of items) view.append(itemCard(list, it));
   }
 }
 function itemCard(list, it) {
-  const st = it.status === "ok" ? el("span", { class: "ok" }, "● funciona") : it.status === "bad" ? el("span", { class: "bad" }, "● no funciona") : it.status === "testing" ? el("span", { class: "warn" }, "● probando…") : el("span", { class: "muted" }, "● sin probar");
+  const tag = (cls, text) => el("span", { class: "tag " + cls }, icon("dot", 10), text);
+  const st = it.status === "ok" ? tag("ok", "Funciona") : it.status === "bad" ? tag("bad", "No funciona") : it.status === "testing" ? tag("warn", "Probando…") : tag("muted", "Sin probar");
   const exp = tokenExpiry(it.url);
-  return el("div", { class: "card" },
+  return el("div", { class: "card" + (it.status ? " st-" + (it.status === "testing" ? "warn" : it.status) : "") },
     el("div", { class: "ch" }, logoEl(it.logo),
       el("div", { class: "t" }, el("b", {}, it.name),
         el("div", { class: "meta" }, st, it.verifiedAt ? ` · ${ago(it.verifiedAt)}` : "", it.res ? ` · ${it.res}` : "", it.why && it.status === "bad" ? ` · ${it.why}` : ""),
-        exp || networkLock(it.url) ? el("div", { class: "meta warn" }, [networkLock(it.url) ? "🔒 amarrado a la red" : "", exp ? (exp < Date.now() ? "⏱ token vencido" : `⏱ vence ${new Date(exp).toLocaleString()}`) : ""].filter(Boolean).join(" · ")) : null),
-      el("button", { class: "btn icon", title: "Ver", onclick: () => play(it) }, "▶"),
-      el("button", { class: "btn icon", title: "Opciones", onclick: () => itemMenu(list, it) }, "⋯")));
+        exp || networkLock(it.url) ? el("div", { class: "meta warn" }, [networkLock(it.url) ? "Amarrado a la red" : "", exp ? (exp < Date.now() ? "Token vencido" : `Vence ${new Date(exp).toLocaleString()}`) : ""].filter(Boolean).join(" · ")) : null),
+      el("button", { class: "btn icon", title: "Ver", onclick: () => play(it) }, icon("play")),
+      el("button", { class: "btn icon", title: "Opciones", onclick: () => itemMenu(list, it) }, icon("more"))));
 }
 async function retest(list, it) {
   it.status = "testing"; renderLists();
@@ -625,13 +631,13 @@ async function retestAll(list) {
   toast(bad ? `${bad} canal(es) no funcionan` : "Todos funcionan");
 }
 function itemMenu(list, it) {
-  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, i), t);
+  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, icon(i, 18)), t);
   sheet(it.name, [
-    opt("🧪", "Probar de nuevo", () => { closeSheet(); retest(list, it); }),
-    opt("📁", "Mover a categoría", () => moveSheet(list, it)),
-    opt("✏️", "Cambiar nombre", () => { const n = cleanTitle(prompt("Nuevo nombre", it.name) || ""); if (n) { it.name = n; touch(list); renderLists(); } closeSheet(); }),
-    opt("⧉", "Copiar link", () => { copyText(it.url, "Link copiado"); closeSheet(); }),
-    opt("🗑", "Quitar de la lista", () => { list.items = list.items.filter((x) => x !== it); touch(list); closeSheet(); renderLists(); renderHeader(); }, "danger")
+    opt("refresh", "Probar de nuevo", () => { closeSheet(); retest(list, it); }),
+    opt("folder", "Mover a categoría", () => moveSheet(list, it)),
+    opt("edit", "Cambiar nombre", () => { const n = cleanTitle(prompt("Nuevo nombre", it.name) || ""); if (n) { it.name = n; touch(list); renderLists(); } closeSheet(); }),
+    opt("copy", "Copiar link", () => { copyText(it.url, "Link copiado"); closeSheet(); }),
+    opt("trash", "Quitar de la lista", () => { list.items = list.items.filter((x) => x !== it); touch(list); closeSheet(); renderLists(); renderHeader(); }, "danger")
   ]);
 }
 function moveSheet(list, it) {
@@ -646,13 +652,13 @@ function moveSheet(list, it) {
   } }, "Mover")]);
 }
 function catMenu(list, g) {
-  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, i), t);
+  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, icon(i, 18)), t);
   const idx = list.categories.indexOf(g);
   sheet(g, [
-    opt("✏️", "Cambiar nombre", () => { const n = cleanTitle(prompt("Nuevo nombre", g) || "").slice(0, 40); if (n && !list.categories.includes(n)) { list.categories[idx] = n; list.items.forEach((x) => { if (x.group === g) x.group = n; }); if (S.listCat === g) S.listCat = n; touch(list); } closeSheet(); renderLists(); }),
-    idx > 0 ? opt("⬆️", "Subir (sale antes en la lista)", () => { list.categories.splice(idx - 1, 0, list.categories.splice(idx, 1)[0]); touch(list); closeSheet(); renderLists(); }) : null,
-    idx < list.categories.length - 1 ? opt("⬇️", "Bajar", () => { list.categories.splice(idx + 1, 0, list.categories.splice(idx, 1)[0]); touch(list); closeSheet(); renderLists(); }) : null,
-    opt("🗑", "Borrar categoría (sus canales pasan a Automática)", () => { list.categories.splice(idx, 1); list.items.forEach((x) => { if (x.group === g) x.group = ""; }); S.listCat = "*"; touch(list); closeSheet(); renderLists(); }, "danger")
+    opt("edit", "Cambiar nombre", () => { const n = cleanTitle(prompt("Nuevo nombre", g) || "").slice(0, 40); if (n && !list.categories.includes(n)) { list.categories[idx] = n; list.items.forEach((x) => { if (x.group === g) x.group = n; }); if (S.listCat === g) S.listCat = n; touch(list); } closeSheet(); renderLists(); }),
+    idx > 0 ? opt("up", "Subir (sale antes en la lista)", () => { list.categories.splice(idx - 1, 0, list.categories.splice(idx, 1)[0]); touch(list); closeSheet(); renderLists(); }) : null,
+    idx < list.categories.length - 1 ? opt("down", "Bajar", () => { list.categories.splice(idx + 1, 0, list.categories.splice(idx, 1)[0]); touch(list); closeSheet(); renderLists(); }) : null,
+    opt("trash", "Borrar categoría (sus canales pasan a Automática)", () => { list.categories.splice(idx, 1); list.items.forEach((x) => { if (x.group === g) x.group = ""; }); S.listCat = "*"; touch(list); closeSheet(); renderLists(); }, "danger")
   ].filter(Boolean));
 }
 function newList() {
@@ -663,12 +669,12 @@ function newList() {
   save({ republish: false }); renderLists(); renderHeader();
 }
 function listMenu(list) {
-  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, i), t);
+  const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, icon(i, 18)), t);
   sheet(list.name, [
-    opt("🧪", "Probar todos los canales", () => retestAll(list)),
-    opt("⤓", "Importar .m3u / .m3u8", () => importSheet(list)),
-    opt("✏️", "Cambiar nombre de la lista", () => { const n = cleanTitle(prompt("Nuevo nombre", list.name) || ""); if (n) { list.name = n; touch(list); } closeSheet(); renderLists(); renderHeader(); }),
-    S.lists.length > 1 ? opt("🗑", "Borrar esta lista", () => {
+    opt("refresh", "Probar todos los canales", () => retestAll(list)),
+    opt("upload", "Importar .m3u / .m3u8", () => importSheet(list)),
+    opt("edit", "Cambiar nombre de la lista", () => { const n = cleanTitle(prompt("Nuevo nombre", list.name) || ""); if (n) { list.name = n; touch(list); } closeSheet(); renderLists(); renderHeader(); }),
+    S.lists.length > 1 ? opt("trash", "Borrar esta lista", () => {
       if (!confirm(`¿Borrar «${list.name}» y sus ${list.items.length} canal(es)?`)) return;
       S.lists = S.lists.filter((l) => l !== list); S.active = S.lists[0].id; save({ republish: false }); closeSheet(); renderLists(); renderHeader();
     }, "danger") : null
@@ -698,7 +704,7 @@ function manualSheet(list) {
     try { const r = await verifyVideo(u); add(true, r); }
     catch (e) {
       test.disabled = false; msg.className = "meta bad";
-      msg.replaceChildren(`✖ No funcionó: ${e.message}. `, el("button", { class: "btn sm", onclick: () => add(false) }, "Agregar igual"));
+      msg.replaceChildren(`No funcionó: ${e.message}. `, el("button", { class: "btn sm", onclick: () => add(false) }, "Agregar igual"));
     }
   } }, "Probar y agregar");
   sheet("Agregar un link", [el("label", {}, "Link del video (.m3u8, .mp4)"), url, el("label", {}, "Nombre"), name, pickTarget(state), msg],
@@ -734,7 +740,7 @@ function importSheet(list) {
   };
   url.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); fetchUrl(); } };
   sheet("Importar lista", [
-    el("button", { class: "btn primary", style: "width:100%", onclick: () => file.click() }, "Elegir archivo .m3u / .m3u8"), file,
+    el("button", { class: "btn primary", style: "width:100%", onclick: () => file.click() }, icon("upload"), "Elegir archivo .m3u / .m3u8"), file,
     el("label", {}, "…o desde un link"), el("div", { class: "row" }, el("div", { class: "grow" }, url), el("button", { class: "btn", onclick: fetchUrl }, "Traer")), msg
   ]);
 }
@@ -762,14 +768,14 @@ function exportSheet(list) {
   const pub = el("div");
   const drawPub = () => {
     pub.replaceChildren();
-    if (!S.settings.ghToken) { pub.append(el("p", { class: "hint" }, "Para un link fijo que se actualiza solo (ideal para pegar una vez en CarTV), conecta GitHub en ⚙️ Ajustes.")); return; }
+    if (!S.settings.ghToken) { pub.append(el("p", { class: "hint" }, "Para un link fijo que se actualiza solo (ideal para pegar una vez en CarTV), conecta GitHub en Ajustes.")); return; }
     if (list.link) {
       pub.append(el("div", { class: "linkbox" }, list.link),
-        el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => copyText(list.link, "Link copiado") }, "Copiar link"),
+        el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => copyText(list.link, "Link copiado") }, icon("copy"), "Copiar link"),
           el("button", { class: "btn", onclick: async (e) => { e.target.disabled = true; try { await publishList(list, fmt.value); toast("Actualizado"); } catch (er) { toast(er.message); } e.target.disabled = false; } }, "Actualizar ahora")),
-        el("p", { class: "hint" }, "En CarTV: agregar lista → «M3U por URL» → pega este link. Se actualiza solo cuando cambias la lista (las apps pueden tardar unos minutos en verlo)."));
+        el("p", { class: "hint" }, "En CarTV: agregar lista, «M3U por URL», pega este link. Se actualiza solo cuando cambias la lista (las apps pueden tardar unos minutos en verlo)."));
     } else {
-      pub.append(el("button", { class: "btn primary", style: "width:100%", onclick: async (e) => { e.target.disabled = true; e.target.textContent = "Publicando…"; try { await publishList(list, fmt.value); drawPub(); } catch (er) { toast(er.message); e.target.disabled = false; e.target.textContent = "Crear link fijo"; } } }, "Crear link fijo"));
+      pub.append(el("button", { class: "btn primary", style: "width:100%", onclick: async (e) => { e.target.disabled = true; e.target.textContent = "Publicando…"; try { await publishList(list, fmt.value); drawPub(); } catch (er) { toast(er.message); e.target.disabled = false; e.target.textContent = "Crear link fijo"; } } }, icon("link"), "Crear link fijo"));
     }
   };
   drawPub();
@@ -777,9 +783,9 @@ function exportSheet(list) {
     el("label", {}, "Formato"), fmt,
     el("p", { class: "hint" }, "Si un canal necesita Referer y CarTV no lo abre, elige «Solo apps IPTV»."),
     el("label", {}, "Archivo"),
-    el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => share(".m3u") }, "Compartir .m3u"), el("button", { class: "btn", onclick: () => share(".m3u8") }, "Compartir .m3u8")),
-    el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => download(".m3u") }, "Descargar .m3u"), el("button", { class: "btn", onclick: () => download(".m3u8") }, "Descargar .m3u8")),
-    el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => copyText(m3uText(list, fmt.value), "Lista copiada") }, "Copiar texto de la lista")),
+    el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => share(".m3u") }, icon("share"), ".m3u"), el("button", { class: "btn", onclick: () => share(".m3u8") }, icon("share"), ".m3u8")),
+    el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => download(".m3u") }, icon("download"), ".m3u"), el("button", { class: "btn", onclick: () => download(".m3u8") }, icon("download"), ".m3u8")),
+    el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => copyText(m3uText(list, fmt.value), "Lista copiada") }, icon("copy"), "Copiar texto de la lista")),
     el("p", { class: "hint" }, "«Compartir» abre el menú del iPhone: elige CarTV, VLC o «Guardar en Archivos»."),
     el("label", {}, "Link fijo"), pub
   ]);
@@ -811,23 +817,23 @@ function renderSettings() {
   fmt.onchange = () => { S.settings.format = fmt.value; S.lists.forEach((l) => (l.dirty = true)); save(); };
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
   put($("#vSettings"),
-    standalone ? null : el("div", { class: "set" }, el("h3", {}, "📲 Instalar en el iPhone"),
-      el("p", { class: "hint" }, "En Safari toca Compartir (el cuadro con la flecha) → «Añadir a pantalla de inicio». Así abre como app, a pantalla completa, y tus listas quedan guardadas.")),
+    standalone ? null : el("div", { class: "set" }, el("h3", {}, icon("phone"), "Instalar en el iPhone"),
+      el("p", { class: "hint" }, "En Safari toca Compartir (el cuadro con la flecha) y luego «Añadir a pantalla de inicio». Así abre como app, a pantalla completa, y tus listas quedan guardadas.")),
     el("div", { class: "set" }, el("h3", {}, "Formato de las listas"), el("label", {}, "Cómo van el Referer y el User-Agent"), fmt),
     el("div", { class: "set" }, el("h3", {}, "Link fijo (GitHub)"),
       el("p", { class: "hint" }, "Publica cada lista como un Gist secreto de GitHub (gratis). El link no cambia aunque edites la lista."),
-      el("a", { href: "https://github.com/settings/tokens/new?scopes=gist&description=Listas%20M3U", target: "_blank", rel: "noopener" }, "1. Crear token con permiso «gist» ↗"),
+      el("a", { href: "https://github.com/settings/tokens/new?scopes=gist&description=Listas%20M3U", target: "_blank", rel: "noopener" }, "1. Crear token con permiso «gist» ", icon("external", 13)),
       el("label", {}, "2. Pega el token"), tok,
       el("p", { class: "hint" }, "El token se guarda solo en este equipo. Quien tenga el link de una lista puede verla."),
-      el("p", { class: "hint" }, "🖥 Con el mismo usuario de GitHub que tiene la extensión, esta app le puede pedir a tu computador que busque un canal o que saque el video de una página (Chrome sí puede abrir páginas por detrás; Safari no). El computador debe estar prendido con Chrome abierto.")),
+      el("p", { class: "hint" }, "Con el mismo usuario de GitHub que tiene la extensión, esta app le puede pedir a tu computador que busque un canal o que saque el video de una página (Chrome sí puede abrir páginas por detrás; Safari no). El computador debe estar prendido con Chrome abierto.")),
     el("div", { class: "set" }, el("h3", {}, "Datos"),
       el("p", { class: "hint" }, `${S.lists.length} lista(s) · ${S.lists.reduce((a, l) => a + l.items.length, 0)} canal(es) guardados en este equipo.`),
       el("div", { class: "acts" },
-        el("button", { class: "btn", onclick: backup }, "Copia de seguridad"),
-        el("button", { class: "btn", onclick: () => { const f = el("input", { type: "file", accept: ".json,application/json" }); f.onchange = () => restore(f.files[0]); f.click(); } }, "Restaurar")),
-      el("div", { class: "acts" }, el("button", { class: "btn", onclick: async () => { try { await caches.delete("directorio-app"); } catch {} Object.keys(dirMem).forEach((k) => delete dirMem[k]); toast("Directorio se descargará de nuevo"); } }, "Actualizar directorio de canales"))),
+        el("button", { class: "btn", onclick: backup }, icon("download"), "Copia de seguridad"),
+        el("button", { class: "btn", onclick: () => { const f = el("input", { type: "file", accept: ".json,application/json" }); f.onchange = () => restore(f.files[0]); f.click(); } }, icon("upload"), "Restaurar")),
+      el("div", { class: "acts" }, el("button", { class: "btn", onclick: async () => { try { await caches.delete("directorio-app"); } catch {} Object.keys(dirMem).forEach((k) => delete dirMem[k]); toast("Directorio se descargará de nuevo"); } }, icon("refresh"), "Actualizar directorio de canales"))),
     el("div", { class: "set" }, el("h3", {}, "Cómo prueba los canales"),
-      el("p", { class: "hint" }, "Cada link se reproduce de verdad en segundo plano: solo cuenta como «funciona» si el video avanza. Los links que exigen Referer no se pueden probar desde Safari y se descartan; los que traen 🔒 solo funcionan en la red donde se probaron.")));
+      el("p", { class: "hint" }, "Cada link se reproduce de verdad en segundo plano: solo cuenta como «funciona» si el video avanza. Los links que exigen Referer no se pueden probar desde Safari y se descartan; los que están amarrados a la red solo funcionan en la red donde se probaron.")));
 }
 function backup() {
   const data = JSON.stringify({ app: "Listas M3U", exportedAt: new Date().toISOString(), lists: S.lists.map(({ dirty, ...l }) => l), settings: { format: S.settings.format } }, null, 2);
@@ -852,7 +858,7 @@ async function restore(file) {
 }
 
 // ---------- navegación ----------
-const TITLES = { vSearch: "🔎 Buscar canal", vLists: "📺 Mis listas", vSettings: "⚙️ Ajustes" };
+const TITLES = { vSearch: "Buscar canal", vLists: "Mis listas", vSettings: "Ajustes" };
 function renderHeader() {
   $("#title").textContent = TITLES[S.view];
   const l = activeList();
@@ -884,5 +890,6 @@ $("#searchForm").onsubmit = (e) => {
   runSearch($("#q").value);
 };
 
+hydrateIcons();
 renderAll();
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
