@@ -61,7 +61,7 @@ syncViewport();
 const S = {
   lists: store.get("m3u.lists", null),
   active: store.get("m3u.active", ""),
-  settings: { format: "iptv", ghToken: "", cartvOnly: true, stopFirst: true, ...store.get("m3u.settings", {}) },
+  settings: { format: "iptv", ghToken: "", cartvOnly: true, stopFirst: true, webCount: 3, ...store.get("m3u.settings", {}) },
   showAll: false, // mostrar también lo que no pasó (o no se pudo confirmar) la prueba como CarTV
   view: "vSearch", listCat: "*",
   search: null // { query, running, step, tried, failed:[], found:[] }
@@ -224,7 +224,9 @@ async function relayJob(payload, job, my, raw = false) {
       try { res = JSON.parse(f.truncated ? await (await fetchT(f.raw_url)).text() : f.content); } catch {}
       if (res) {
         acked = true;
-        job.step = "Tu computador: " + res.step; job.tried = res.tried || job.tried; renderSearch();
+        job.step = "Tu computador: " + res.step; job.tried = res.tried || job.tried;
+        if (Array.isArray(res.pages)) job.pages = res.pages;
+        renderSearch();
         if (res.status === "done") {
           ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [`res-${rid}.json`]: null } }) }).catch(() => {});
           for (const x of res.failed || []) job.failed.push({ host: x.host, why: "(computador) " + x.why });
@@ -544,6 +546,9 @@ function verifyVideo(url, ms = 16000) {
 const MAX_FOUND = Infinity, MAX_TESTS = Infinity; // sin límite: se prueban todos y tú eliges cuáles agregar
 // Orden estricto: un link a la vez, en el orden de la búsqueda; con «parar en el primero» termina apenas uno funciona
 const stopFirstOn = () => S.settings.stopFirst !== false;
+const webCountOf = () => Math.max(0, Math.round(+(S.settings.webCount ?? 3)) || 0);
+// lo que se le pide al computador lleva los mismos ajustes de búsqueda de esta app
+const pcOpts = () => ({ stopFirst: stopFirstOn(), webCount: webCountOf() });
 const searchDone = (job) => job.found.length >= MAX_FOUND || (stopFirstOn() && job.found.length > 0);
 let searchToken = 0;
 async function runSearch(query) {
@@ -555,9 +560,8 @@ async function runSearch(query) {
   try {
     const { streams, sites } = await candidates(query);
     job.sites = sites;
-    if (!streams.length) { job.step = "No encontré ese canal en el directorio."; return; }
     const list = streams.slice(0, MAX_TESTS);
-    job.step = `Probando ${list.length} link(s): los reproduzco uno por uno…`;
+    job.step = list.length ? `Probando ${list.length} link(s): los reproduzco uno por uno…` : "No está en el directorio de canales.";
     renderSearch();
     const seen = new Set();
     const conc = 1; // de a uno, en el orden de la búsqueda
@@ -582,8 +586,23 @@ async function runSearch(query) {
       }
     }));
     if (my !== searchToken) return;
-    job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : `Probé ${job.tried} link(s) y ninguno funcionó.`;
+    job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : list.length ? `Probé ${job.tried} link(s) y ninguno funcionó.` : "No encontré ese canal en el directorio.";
     await confirmCarTV(job, my);
+    if (my !== searchToken) return;
+    // Igual que la extensión: si el directorio no alcanzó, sigue con el sitio oficial y los resultados de la web
+    // (los que elegiste en Ajustes). Safari no puede abrir páginas por detrás: eso lo hace tu computador.
+    const good = job.found.some((f) => ["official", "cdn"].includes(tierOf(f).tier) && !needsPlayerSession(f.url) && f.car?.ok !== false);
+    // cuenta solo lo que sirve en CarTV (si el computador lo confirmó), como en la extensión
+    const usable = job.found.filter((f) => f.car?.ok !== false).length;
+    const done = usable >= MAX_FOUND || (stopFirstOn() && usable > 0);
+    if (!done && !good && S.settings.ghToken && job.pcState !== "off") { // si el computador ya no respondió, no se le vuelve a esperar
+      const had = job.found.length;
+      job.pcSearched = true;
+      await addPcResults(await relayJob({ query, skipDirTests: q.length === 0, ...pcOpts() }, job, my), job, my);
+      if (my !== searchToken) return;
+      job.viaPc = false;
+      if (job.found.length > had) job.step = `${job.found.length} link(s) encontrado(s) · ${job.found.length - had} por tu computador (sitio oficial y web).`;
+    } else if (!usable && !S.settings.ghToken) job.step += " Para seguir buscando en el sitio oficial y en la web, conecta en Ajustes el mismo GitHub de la extensión.";
   } catch (e) {
     if (my !== searchToken) return;
     job.step = job.viaPc ? e.message : "No se pudo leer el directorio de canales. Revisa tu conexión e intenta de nuevo.";
@@ -640,7 +659,7 @@ async function runPage(pageUrl) {
     // 2) con el computador: abre la página en Chrome, le da play y captura lo que pide el reproductor
     if (!job.found.length && my === searchToken) {
       if (!S.settings.ghToken) { job.step = "Aquí no encontré el video. Para sacarlo con tu computador, conecta en Ajustes el mismo GitHub de la extensión."; return; }
-      await addPcResults(await relayJob({ pageUrl, stopFirst: stopFirstOn() }, job, my), job, my);
+      await addPcResults(await relayJob({ pageUrl, ...pcOpts() }, job, my), job, my);
     }
     if (my !== searchToken) return;
     if (job.found.some((f) => !f.car)) await confirmCarTV(job, my);
@@ -655,7 +674,7 @@ async function runPage(pageUrl) {
 async function runPcSearch(query) {
   const my = ++searchToken;
   const job = S.search = { query, running: true, step: "", tried: 0, failed: [], found: [], sites: [], viaPc: true };
-  try { await addPcResults(await relayJob({ query, stopFirst: stopFirstOn() }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
+  try { await addPcResults(await relayJob({ query, ...pcOpts() }, job, my), job, my); if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) por tu computador.` : job.step; }
   catch (e) { if (my === searchToken) job.step = e.message; }
   finally { if (my === searchToken) { job.running = false; renderSearch(); } }
 }
@@ -687,6 +706,8 @@ function renderSearch() {
   const st = el("div", { class: "status" + (j.running ? " run" : "") },
     el("div", {}, j.running ? el("span", { class: "spin" }) : null, `${j.pageUrl ? "Página " + hostOf(j.pageUrl) : "«" + j.query + "»"} · ${j.step}`),
     el("div", { class: "meta" }, `${j.tried} probado(s) · ${j.found.length} verificado(s) · ${j.failed.length} descartado(s)`));
+  if (j.pages?.length) st.append(el("details", {}, el("summary", {}, `Páginas revisadas (${j.pages.length})`),
+    el("ul", {}, j.pages.map((p) => el("li", {}, `${p.found ? "✓" : "·"} ${p.url.replace(/^https?:\/\/(www\.)?/, "")}${p.found ? ` — ${p.found} link(s)` : ""}`)))));
   if (j.failed.length) st.append(el("details", {}, el("summary", {}, "Ver por qué se descartaron"), el("ul", {}, j.failed.slice(-15).map((f) => el("li", {}, `${f.host}: ${f.why}`)))));
   out.append(st);
   if (j.found.length) {
@@ -694,7 +715,7 @@ function renderSearch() {
     out.append(el("p", { class: "hint" }, "Funcionan: " + ["official", "cdn", "page", "unknown", "unofficial"].filter((t) => c[t]).map((t) => `${c[t]} ${TIER_LABEL[t].toLowerCase()}`).join(" · ") + ". Tú eliges cuáles agregar."));
   }
   const hasOfficial = j.found.some((f) => ["official", "cdn"].includes(tierOf(f).tier) && !needsPlayerSession(f.url));
-  if (!j.running && !hasOfficial && !j.pageUrl && !j.viaPc) {
+  if (!j.running && !hasOfficial && !j.pageUrl && !j.viaPc && !j.pcSearched) {
     out.append(el("p", { class: "hint" }, j.found.length
       ? "Ninguno es oficial. Si quieres, tu computador (si está prendido) saca el link de la página oficial:"
       : "Prueba con otro nombre (sin «canal» ni «TV»), pega arriba el link de la página donde lo ves, o pídele a tu computador que lo busque en la web y en su página oficial:"),
@@ -1109,11 +1130,17 @@ function renderSettings() {
         (() => { const c = el("input", { type: "checkbox", checked: S.settings.cartvOnly !== false, style: "width:22px;height:22px" }); c.onchange = () => { S.settings.cartvOnly = c.checked; save({ republish: false }); }; return c; })(),
         "Mostrar en la búsqueda solo lo que pasó la prueba como CarTV"),
       el("p", { class: "hint" }, "Tu computador (si está prendido) prueba cada resultado exactamente como lo pide CarTV, incluso los que Safari no puede probar. Tus canales guardados se vuelven a probar solos y llevan la marca «Apto CarTV».")),
-    el("div", { class: "set" }, el("h3", {}, icon("search"), "Orden de la búsqueda"),
+    el("div", { class: "set" }, el("h3", {}, icon("search"), "Búsqueda"),
       el("label", { style: "display:flex;gap:10px;align-items:center;text-transform:none;letter-spacing:0;font:inherit;color:var(--text)" },
         (() => { const c = el("input", { type: "checkbox", checked: S.settings.stopFirst !== false, style: "width:22px;height:22px" }); c.onchange = () => { S.settings.stopFirst = c.checked; save({ republish: false }); }; return c; })(),
         "Parar en el primer link que funcione"),
-      el("p", { class: "hint" }, "La búsqueda prueba link por link, en el orden de los resultados. Desactívalo para revisarlos todos y elegir tú cuáles agregar.")),
+      el("p", { class: "hint" }, "La búsqueda prueba link por link, en el orden de los resultados. Desactívalo para revisarlos todos y elegir tú cuáles agregar."),
+      el("label", { style: "display:flex;gap:10px;align-items:center;text-transform:none;letter-spacing:0;font:inherit;color:var(--text);margin-top:10px" },
+        (() => { const n = el("input", { class: "field", type: "number", min: "0", step: "1", inputmode: "numeric", value: String(webCountOf()), style: "width:80px" });
+          const put = () => { if (n.value === "") return; S.settings.webCount = Math.max(0, Math.round(+n.value) || 0); save({ republish: false }); };
+          n.oninput = put; n.onchange = () => { n.value = String(webCountOf()); put(); }; return n; })(),
+        "Resultados de la web a revisar"),
+      el("p", { class: "hint" }, "Último recurso, después del directorio y del sitio oficial. Sin límite: tú eliges cuántos. Las páginas las abre tu computador (Chrome), porque Safari no puede abrir otras páginas por detrás.")),
     el("div", { class: "set" }, el("h3", {}, "Formato de las listas"), el("label", {}, "Cómo van el Referer y el User-Agent"), fmt),
     el("div", { class: "set" }, el("h3", {}, "Link fijo (GitHub)"),
       el("p", { class: "hint" }, "Publica cada lista como un Gist secreto de GitHub (gratis). El link no cambia aunque edites la lista."),
