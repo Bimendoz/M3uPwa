@@ -80,7 +80,7 @@ function save({ republish = true } = {}) {
     pubTimer = setTimeout(() => S.lists.filter((l) => l.link && l.dirty).forEach((l) => publishList(l).catch(() => {})), 2500);
   }
 }
-const touch = (list) => { list.dirty = true; save(); };
+const touch = (list) => { list.dirty = true; save(); if (list.id === "sync") syncSoon(); };
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 
 // ---------- links: vencimiento y amarre a la red ----------
@@ -287,6 +287,112 @@ const TIER_LABEL = { official: "Oficial", cdn: "Plataforma", page: "De la págin
 const TIER_RANK = { official: 0, cdn: 1, page: 2, unknown: 3, unofficial: 4 };
 const tierOf = (item) => (item.tier ? { tier: item.tier, why: item.tierWhy || [] } : sourceInfo(item.url, { pageUrl: item.pageUrl }));
 
+
+// ---------- sincronización de canales (extensión ↔ PWA) — mismo código en los dos lados ----------
+// Un solo archivo en el Gist del puente guarda la lista compartida: { items, tomb, categories, catU, pub }.
+// Cada canal lleva _u (cuándo cambió). Gana el cambio más reciente; lo borrado deja una «lápida» (tomb)
+// para que el otro lado no lo vuelva a agregar. «base» es lo último que este equipo sincronizó: comparando
+// contra ella se sabe qué cambió aquí sin tener que marcar cada edición a mano.
+const SYNC_FILE = "canales-sync.json";
+const SHARED_FIELDS = ["key", "url", "kind", "referer", "name", "group", "thumb", "live", "tvgId", "tier", "tierWhy", "pageUrl", "useChannel", "channelLive", "ytId", "author"];
+function shareOf(it) {
+  const o = {};
+  for (const f of SHARED_FIELDS) if (it[f] !== undefined && it[f] !== null && it[f] !== "") o[f] = it[f];
+  return o;
+}
+function syncMerge(localItems, localCats, base, remote, now = Date.now()) {
+  base = base || {}; remote = remote || {};
+  const bh = base.hashes || {}, bu = base.u || {};
+  const tomb = { ...(remote.tomb || {}) };
+  const local = localItems.map((it) => {
+    const s = shareOf(it), h = JSON.stringify(s);
+    return { ...s, _u: bh[s.key] === h ? (bu[s.key] || 1) : now }; // cambió aquí desde la última vez -> ahora
+  });
+  const localKeys = new Set(local.map((x) => x.key));
+  for (const k of Object.keys(bh)) if (!localKeys.has(k)) tomb[k] = Math.max(tomb[k] || 0, now); // borrado aquí
+  const out = new Map();
+  for (const it of remote.items || []) out.set(it.key, it);
+  for (const it of local) { const r = out.get(it.key); if (!r || it._u >= (r._u || 0)) out.set(it.key, it); }
+  for (const [k, t] of Object.entries(tomb)) {
+    const it = out.get(k);
+    if (it && (it._u || 0) <= t) out.delete(k);
+    if (now - t > 60 * 864e5) delete tomb[k]; // las lápidas viejas se limpian a los 60 días
+  }
+  // categorías: la primera vez se juntan; después gana el cambio más reciente
+  const lc = localCats || [], rc = remote.categories;
+  let categories, catU;
+  if (base.cats === undefined) { categories = [...new Set([...(rc || []), ...lc])]; catU = now; }
+  else if (JSON.stringify(lc) !== base.cats && now >= (remote.catU || 0)) { categories = lc; catU = now; }
+  else { categories = rc || lc; catU = remote.catU || now; }
+  const items = [...out.values()];
+  const hashes = {}, u = {};
+  for (const it of items) { const { _u, ...s } = it; hashes[it.key] = JSON.stringify(shareOf(s)); u[it.key] = _u || 1; }
+  return { items, tomb, categories, catU, base: { hashes, u, cats: JSON.stringify(categories) } };
+}
+// Rehace la lista local con lo sincronizado, conservando los datos que solo existen en este equipo
+function syncApply(localItems, mergedItems, toLocal) {
+  const byKey = new Map(localItems.map((x) => [x.key, x]));
+  return mergedItems.map((s) => {
+    const { _u, ...shared } = s;
+    const old = byKey.get(s.key);
+    if (!old) return toLocal ? toLocal(shared, null) : { ...shared, addedAt: Date.now() };
+    const keep = { ...old };
+    for (const f of SHARED_FIELDS) delete keep[f];
+    return toLocal ? toLocal(shared, keep) : { ...keep, ...shared };
+  });
+}
+
+// La lista con id "sync" es la misma que «Guardados» de la extensión
+let syncBusy = false, syncAgain = false, syncTimer = null;
+function ensureSyncList() {
+  if (S.lists.some((l) => l.id === "sync")) return;
+  const l = activeList();
+  l.id = "sync";
+  if (l.name === "Mi lista") l.name = "Mis canales";
+  S.active = "sync";
+  save({ republish: false });
+}
+const syncPubLink = () => { const p = S.settings.syncPub; return p?.gistId && p.owner ? `https://gist.githubusercontent.com/${p.owner}/${p.gistId}/raw/${p.file || "lista.m3u"}` : ""; };
+async function pwaSync(reason = "auto") {
+  if (!S.settings.ghToken) return;
+  ensureSyncList();
+  if (syncBusy) { syncAgain = true; return; }
+  syncBusy = true;
+  try {
+    const list = S.lists.find((l) => l.id === "sync");
+    const id = await relayGistId();
+    const g = await ghApi(`/gists/${id}`);
+    const f = g.files[SYNC_FILE];
+    let remote = {};
+    if (f) { try { remote = JSON.parse(f.truncated ? await (await fetchT(f.raw_url)).text() : f.content); } catch {} }
+    const localShared = list.items.map((it) => ({ ...it, thumb: it.logo || it.thumb || "", kind: it.kind || "hls" }));
+    const m = syncMerge(localShared, list.categories, S.settings.syncBase, remote);
+    const next = { v: 1, items: m.items, tomb: m.tomb, categories: m.categories, catU: m.catU, pub: remote.pub };
+    const changedRemote = JSON.stringify(next) !== JSON.stringify({ v: remote.v, items: remote.items, tomb: remote.tomb, categories: remote.categories, catU: remote.catU, pub: remote.pub });
+    if (changedRemote) await ghApi(`/gists/${id}`, { method: "PATCH", body: JSON.stringify({ files: { [SYNC_FILE]: { content: JSON.stringify({ ...next, at: Date.now() }) } } }) });
+    list.items = syncApply(localShared, m.items, (sh, keep) => ({ id: keep?.id || uid(), status: "", verifiedAt: 0, ...(keep || {}), ...sh, logo: sh.thumb || "" }));
+    list.categories = m.categories;
+    S.settings.syncBase = m.base;
+    S.settings.syncPub = remote.pub || S.settings.syncPub || null;
+    S.settings.syncMeta = { lastSync: Date.now(), count: list.items.length, error: "" };
+    save({ republish: false });
+    // el link fijo de la extensión (el que tienes en CarTV) se actualiza también desde aquí
+    if (changedRemote && remote.pub?.gistId) {
+      ghApi(`/gists/${remote.pub.gistId}`, { method: "PATCH", body: JSON.stringify({ files: { [remote.pub.file || "lista.m3u"]: { content: m3uText(list) } } }) }).catch(() => {});
+    }
+    if (S.view === "vLists" && $("#sheet").hidden) renderLists();
+    renderHeader();
+  } catch (e) {
+    S.settings.syncMeta = { ...(S.settings.syncMeta || {}), error: e.message, lastTry: Date.now() };
+    save({ republish: false });
+    if (S.view === "vLists" && $("#sheet").hidden) renderLists();
+  } finally {
+    syncBusy = false;
+    if (syncAgain) { syncAgain = false; setTimeout(() => pwaSync("repetir"), 500); }
+  }
+}
+function syncSoon() { clearTimeout(syncTimer); syncTimer = setTimeout(() => pwaSync("cambio"), 2500); }
+
 // ---------- directorio de canales (iptv-org, caché 24 h) ----------
 const DIR = "https://iptv-org.github.io/api/";
 const dirMem = {};
@@ -364,8 +470,6 @@ function mediaError(v) {
     : "no se pudo reproducir";
 }
 function verifyVideo(url, ms = 16000) {
-  if (location.protocol === "https:" && /^http:\/\//i.test(url))
-    return Promise.reject(new Error("link http (inseguro): Safari no lo reproduce dentro de la app, pero tu computador sí puede probarlo"));
   return new Promise((resolve, reject) => {
     const v = el("video", { muted: true, playsInline: true, preload: "auto" });
     v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
@@ -413,18 +517,12 @@ async function runSearch(query) {
   query = cleanTitle(query);
   if (!query) return;
   const my = ++searchToken;
-  const job = S.search = { query, running: true, step: "Buscando en el directorio de canales…", tried: 0, failed: [], found: [], sites: [] };
+  const job = S.search = { query, running: true, step: "Buscando en el directorio de canales…", tried: 0, failed: [], found: [], untested: [], sites: [] };
   renderSearch();
   try {
     const { streams, sites } = await candidates(query);
     job.sites = sites;
-    if (!streams.length) {
-      if (S.settings.ghToken) { // el computador busca también en la web y en la página oficial
-        await addPcResults(await relayJob({ query }, job, my), job, my);
-        if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) con ayuda de tu computador.` : job.step;
-      } else job.step = "No encontré ese canal en el directorio. Conecta GitHub en Ajustes para que tu computador lo busque en la web.";
-      return;
-    }
+    if (!streams.length) { job.step = "No encontré ese canal en el directorio."; return; }
     const list = streams.slice(0, MAX_TESTS);
     job.step = `Probando ${list.length} link(s): los reproduzco uno por uno…`;
     renderSearch();
@@ -444,21 +542,13 @@ async function runSearch(query) {
           const si = sourceInfo(c.url, { website: c.website });
           job.found.push({ ...c, tier: si.tier, tierWhy: si.why, key: k, live: r.live, res: r.h ? r.h + "p" : r.audioOnly ? "solo audio" : "", verifiedAt: Date.now(), lock: networkLock(c.url), exp: tokenExpiry(c.url) });
         } catch (e) {
-          job.failed.push({ host: hostOf(c.url), why: (c.referer ? "necesita Referer (no se puede probar en Safari) · " : "") + e.message });
+          if (c.referer) { const si = sourceInfo(c.url, { website: c.website }); job.untested.push({ ...c, tier: si.tier, tierWhy: si.why, key: k }); }
+          else job.failed.push({ host: hostOf(c.url), why: e.message });
         }
         renderSearch();
       }
     }));
     if (my !== searchToken) return;
-    const hasGood = job.found.some((f) => f.tier === "official" || (f.tier === "cdn" && !needsPlayerSession(f.url)));
-    if (!hasGood && S.settings.ghToken) {
-      job.step = job.found.length ? "Ninguno es oficial: pidiéndole a tu computador el link de la página oficial…" : job.step;
-      await addPcResults(await relayJob({ query }, job, my), job, my);
-      if (my !== searchToken) return;
-      job.found.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3));
-      job.step = job.found.length ? `${job.found.length} link(s) funcionan (con ayuda de tu computador).` : job.step;
-      return;
-    }
     job.found.sort((a, b) => (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3));
     job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : `Probé ${job.tried} link(s) y ninguno funcionó.`;
   } catch (e) {
@@ -540,8 +630,11 @@ function renderSearch() {
     const c = {}; j.found.forEach((f) => { const t = tierOf(f).tier; c[t] = (c[t] || 0) + 1; });
     out.append(el("p", { class: "hint" }, "Funcionan: " + ["official", "cdn", "page", "unknown", "unofficial"].filter((t) => c[t]).map((t) => `${c[t]} ${TIER_LABEL[t].toLowerCase()}`).join(" · ") + ". Tú eliges cuáles agregar."));
   }
-  if (!j.running && !j.found.length && !j.pageUrl && !j.viaPc) {
-    out.append(el("p", { class: "hint" }, "Prueba con otro nombre (sin «canal» ni «TV»), pega arriba el link de la página donde lo ves, o pídele a tu computador que lo busque en la web y en su página oficial:"),
+  const hasOfficial = j.found.some((f) => ["official", "cdn"].includes(tierOf(f).tier) && !needsPlayerSession(f.url));
+  if (!j.running && !hasOfficial && !j.pageUrl && !j.viaPc) {
+    out.append(el("p", { class: "hint" }, j.found.length
+      ? "Ninguno es oficial. Si quieres, tu computador (si está prendido) saca el link de la página oficial:"
+      : "Prueba con otro nombre (sin «canal» ni «TV»), pega arriba el link de la página donde lo ves, o pídele a tu computador que lo busque en la web y en su página oficial:"),
       el("button", { class: "btn", style: "width:100%", onclick: () => (S.settings.ghToken ? runPcSearch(j.query) : (toast("Conecta GitHub en Ajustes"), setView("vSettings"))) }, icon("laptop"), "Buscar con mi computador"));
     for (const s of j.sites) out.append(el("a", { class: "btn sm", href: s, target: "_blank", rel: "noopener", style: "display:inline-block;margin:4px 6px 0 0;text-decoration:none" }, "Abrir " + hostOf(s)));
   }
@@ -559,6 +652,20 @@ function renderSearch() {
         el("button", { class: "btn icon", title: "Ver", onclick: () => play(f) }, icon("play")),
         el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, icon("copy"))),
       weak && f.website ? el("button", { class: "btn", style: "width:100%;margin-top:8px", onclick: () => runPage(f.website) }, icon("laptop"), `Sacar link completo de ${hostOf(f.website)}`) : null));
+  }
+  // los que exigen Referer: Safari no puede probarlos, pero en CarTV pueden funcionar (formato «Apps IPTV»)
+  if (j.untested?.length) {
+    out.append(el("h2", {}, "Sin probar aquí", el("span", { class: "n" }, j.untested.length)),
+      el("p", { class: "hint" }, "Necesitan Referer: Safari no los puede probar, pero en CarTV pueden funcionar. Agrégalos si quieres y pruébalos allá."));
+    for (const f of j.untested) {
+      const ti = tierOf(f);
+      out.append(el("div", { class: "card st-warn" },
+        el("div", { class: "ch" }, logoEl(f.logo), el("div", { class: "t" }, el("span", { class: "tier t-" + ti.tier, title: ti.why.join(" · ") }, TIER_LABEL[ti.tier]), el("b", {}, f.name),
+          el("div", { class: "meta tag warn" }, icon("alert", 12), "Sin probar · necesita Referer"))),
+        el("div", { class: "meta", style: "margin-top:6px" }, f.url),
+        el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => addSheet(f) }, icon("plus"), "Agregar igual"),
+          el("button", { class: "btn icon", title: "Copiar link", onclick: () => copyText(f.url, "Link copiado") }, icon("copy")))));
+    }
   }
 }
 
@@ -656,7 +763,10 @@ function renderLists() {
     el("div", { class: "acts", style: "margin-top:4px" },
       el("button", { class: "btn primary", onclick: () => exportSheet(list), disabled: !list.items.length }, icon("share"), "Exportar"),
       el("button", { class: "btn", onclick: () => manualSheet(list) }, icon("plus"), "Link")),
-    list.link ? el("div", { class: "meta tag", style: "margin-top:8px" }, icon("link", 12), "Link fijo publicado: se actualiza solo al cambiar la lista.") : null,
+    list.id === "sync" ? el("div", { class: "meta tag " + (S.settings.syncMeta?.error ? "bad" : "ok"), style: "margin-top:8px" }, icon("refresh", 12),
+      S.settings.syncMeta?.error ? "Error al sincronizar: " + S.settings.syncMeta.error
+        : S.settings.syncMeta?.lastSync ? `Sincronizada con el computador · ${ago(S.settings.syncMeta.lastSync)}` : "Sincronizando…")
+      : list.link ? el("div", { class: "meta tag", style: "margin-top:8px" }, icon("link", 12), "Link fijo publicado: se actualiza solo al cambiar la lista.") : null,
     groups.size ? el("div", { class: "chips", style: "margin-top:12px" },
       el("button", { class: "chip" + (S.listCat === "*" ? " on" : ""), onclick: () => { S.listCat = "*"; renderLists(); } }, "Todas"),
       [...groups.keys()].map((g) => el("button", { class: "chip" + (S.listCat === g ? " on" : ""), onclick: () => { S.listCat = g; renderLists(); } }, `${g} · ${groups.get(g).length}`)),
@@ -739,10 +849,11 @@ function newList() {
 function listMenu(list) {
   const opt = (i, t, fn, cls = "") => el("button", { class: "opt " + cls, onclick: fn }, el("span", { class: "i" }, icon(i, 18)), t);
   sheet(list.name, [
+    list.id === "sync" ? opt("refresh", "Sincronizar ahora con el computador", () => { closeSheet(); pwaSync("manual").then(() => toast(S.settings.syncMeta?.error ? "No se pudo sincronizar" : "Sincronizado")); }) : null,
     opt("refresh", "Probar todos los canales", () => retestAll(list)),
     opt("upload", "Importar .m3u / .m3u8", () => importSheet(list)),
     opt("edit", "Cambiar nombre de la lista", () => { const n = cleanTitle(prompt("Nuevo nombre", list.name) || ""); if (n) { list.name = n; touch(list); } closeSheet(); renderLists(); renderHeader(); }),
-    S.lists.length > 1 ? opt("trash", "Borrar esta lista", () => {
+    S.lists.length > 1 && list.id !== "sync" ? opt("trash", "Borrar esta lista", () => {
       if (!confirm(`¿Borrar «${list.name}» y sus ${list.items.length} canal(es)?`)) return;
       S.lists = S.lists.filter((l) => l !== list); S.active = S.lists[0].id; save({ republish: false }); closeSheet(); renderLists(); renderHeader();
     }, "danger") : null
@@ -837,6 +948,12 @@ function exportSheet(list) {
   const drawPub = () => {
     pub.replaceChildren();
     if (!S.settings.ghToken) { pub.append(el("p", { class: "hint" }, "Para un link fijo que se actualiza solo (ideal para pegar una vez en CarTV), conecta GitHub en Ajustes.")); return; }
+    if (list.id === "sync" && syncPubLink()) {
+      pub.append(el("div", { class: "linkbox" }, syncPubLink()),
+        el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => copyText(syncPubLink(), "Link copiado") }, icon("copy"), "Copiar link")),
+        el("p", { class: "hint" }, "Es el mismo link de la extensión: se actualiza desde aquí y desde el computador. Pégalo una vez en CarTV («M3U por URL»)."));
+      return;
+    }
     if (list.link) {
       pub.append(el("div", { class: "linkbox" }, list.link),
         el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => copyText(list.link, "Link copiado") }, icon("copy"), "Copiar link"),
@@ -879,7 +996,7 @@ async function publishList(list, format = S.settings.format) {
 // ---------- ajustes ----------
 function renderSettings() {
   const tok = el("input", { class: "field", type: "password", placeholder: "ghp_…", value: S.settings.ghToken, autocapitalize: "off", spellcheck: false });
-  tok.onchange = () => { S.settings.ghToken = tok.value.trim(); save({ republish: false }); toast(S.settings.ghToken ? "GitHub conectado" : "GitHub desconectado"); };
+  tok.onchange = () => { S.settings.ghToken = tok.value.trim(); S.settings.relayGistId = ""; save({ republish: false }); toast(S.settings.ghToken ? "GitHub conectado: sincronizando…" : "GitHub desconectado"); if (S.settings.ghToken) pwaSync("conectar"); };
   const fmt = el("select", { class: "field" }, el("option", { value: "iptv" }, "Apps IPTV: CarTV, Kodi (recomendado)"), el("option", { value: "both" }, "VLC + apps IPTV (el Referer no llega a CarTV)"), el("option", { value: "vlc" }, "Solo VLC"));
   fmt.value = S.settings.format;
   fmt.onchange = () => { S.settings.format = fmt.value; S.lists.forEach((l) => (l.dirty = true)); save(); };
@@ -893,7 +1010,7 @@ function renderSettings() {
       el("a", { href: "https://github.com/settings/tokens/new?scopes=gist&description=Listas%20M3U", target: "_blank", rel: "noopener" }, "1. Crear token con permiso «gist» ", icon("external", 13)),
       el("label", {}, "2. Pega el token"), tok,
       el("p", { class: "hint" }, "El token se guarda solo en este equipo. Quien tenga el link de una lista puede verla."),
-      el("p", { class: "hint" }, "Con el mismo usuario de GitHub que tiene la extensión, esta app le puede pedir a tu computador que busque un canal o que saque el video de una página (Chrome sí puede abrir páginas por detrás; Safari no). El computador debe estar prendido con Chrome abierto.")),
+      el("p", { class: "hint" }, "Con el mismo usuario de GitHub que tiene la extensión, tus canales quedan sincronizados: lo que agregues, borres o cambies aquí aparece en Guardados del computador y al revés, desde cualquier red y aunque el computador esté apagado. Además, esta app le puede pedir a tu computador que busque un canal o que saque el video de una página (Chrome sí puede abrir páginas por detrás; Safari no). El computador debe estar prendido con Chrome abierto.")),
     el("div", { class: "set" }, el("h3", {}, "Datos"),
       el("p", { class: "hint" }, `${S.lists.length} lista(s) · ${S.lists.reduce((a, l) => a + l.items.length, 0)} canal(es) guardados en este equipo.`),
       el("div", { class: "acts" },
@@ -960,4 +1077,7 @@ $("#searchForm").onsubmit = (e) => {
 
 hydrateIcons();
 renderAll();
+if (S.settings.ghToken) { ensureSyncList(); pwaSync("abrir"); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pwaSync("volver"); });
+setInterval(() => { if (!document.hidden) pwaSync("periódica"); }, 30000);
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
