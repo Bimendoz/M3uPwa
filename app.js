@@ -61,10 +61,12 @@ syncViewport();
 const S = {
   lists: store.get("m3u.lists", null),
   active: store.get("m3u.active", ""),
-  settings: { format: "both", ghToken: "", ...store.get("m3u.settings", {}) },
+  settings: { format: "iptv", ghToken: "", ...store.get("m3u.settings", {}) },
   view: "vSearch", listCat: "*",
   search: null // { query, running, step, tried, failed:[], found:[] }
 };
+// Una sola vez: el formato viejo por defecto («both») pasa a «iptv», que es el que CarTV entiende
+if (!S.settings.fmtV2) { if (S.settings.format === "both") S.settings.format = "iptv"; S.settings.fmtV2 = true; store.set("m3u.settings", S.settings); }
 if (!Array.isArray(S.lists) || !S.lists.length) S.lists = [{ id: uid(), name: "Mi lista", categories: [], items: [] }];
 if (!S.lists.some((l) => l.id === S.active)) S.active = S.lists[0].id;
 const activeList = () => S.lists.find((l) => l.id === S.active) || S.lists[0];
@@ -234,7 +236,7 @@ async function addPcResults(found, job, my) {
     if (my !== searchToken || job.found.some((x) => x.key === keyOf(f.url))) continue;
     const item = { url: f.url, referer: f.referer || "", name: f.name, logo: f.thumb || "", tvgId: f.tvgId || "", key: keyOf(f.url),
       live: f.live, res: f.res ? String(f.res).split("x").pop() + "p" : "", verifiedAt: f.verifiedAt || Date.now(), lock: networkLock(f.url), exp: tokenExpiry(f.url), viaPc: true };
-    if (f.referer) item.note = "Probado por tu computador (necesita Referer; en CarTV usa el formato «Solo apps IPTV»)";
+    if (f.needs === "referer") item.note = "Probado por tu computador (necesita Referer: Safari no puede probarlo)";
     else {
       job.step = `Probando aquí ${hostOf(f.url)}…`; renderSearch();
       try { const r = await verifyVideo(f.url); item.res = r.h ? r.h + "p" : item.res; item.note = "Probado por tu computador y en este equipo"; }
@@ -321,6 +323,8 @@ function mediaError(v) {
     : "no se pudo reproducir";
 }
 function verifyVideo(url, ms = 16000) {
+  if (location.protocol === "https:" && /^http:\/\//i.test(url))
+    return Promise.reject(new Error("link http (inseguro): Safari no lo reproduce dentro de la app, pero tu computador sí puede probarlo"));
   return new Promise((resolve, reject) => {
     const v = el("video", { muted: true, playsInline: true, preload: "auto" });
     v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
@@ -373,7 +377,13 @@ async function runSearch(query) {
   try {
     const { streams, sites } = await candidates(query);
     job.sites = sites;
-    if (!streams.length) { job.step = "No encontré ese canal en el directorio."; return; }
+    if (!streams.length) {
+      if (S.settings.ghToken) { // el computador busca también en la web y en la página oficial
+        await addPcResults(await relayJob({ query }, job, my), job, my);
+        if (my === searchToken) job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) con ayuda de tu computador.` : job.step;
+      } else job.step = "No encontré ese canal en el directorio. Conecta GitHub en Ajustes para que tu computador lo busque en la web.";
+      return;
+    }
     const list = streams.slice(0, MAX_TESTS);
     job.step = `Probando ${list.length} link(s): los reproduzco uno por uno…`;
     renderSearch();
@@ -398,10 +408,16 @@ async function runSearch(query) {
       }
     }));
     if (my !== searchToken) return;
+    if (!job.found.length && S.settings.ghToken) {
+      await addPcResults(await relayJob({ query }, job, my), job, my);
+      if (my !== searchToken) return;
+      job.step = job.found.length ? `${job.found.length} link(s) encontrado(s) con ayuda de tu computador.` : job.step;
+      return;
+    }
     job.step = job.found.length ? `${job.found.length} link(s) verificado(s) de ${job.tried} probado(s).` : `Probé ${job.tried} link(s) y ninguno funcionó.`;
   } catch (e) {
     if (my !== searchToken) return;
-    job.step = "No se pudo leer el directorio de canales. Revisa tu conexión e intenta de nuevo.";
+    job.step = job.viaPc ? e.message : "No se pudo leer el directorio de canales. Revisa tu conexión e intenta de nuevo.";
   } finally {
     if (my === searchToken) { job.running = false; renderSearch(); }
   }
@@ -748,8 +764,8 @@ function importSheet(list) {
 // exportar / compartir / publicar
 function exportSheet(list) {
   const fmt = el("select", { class: "field" },
-    el("option", { value: "both" }, "VLC + apps IPTV (recomendado)"),
-    el("option", { value: "iptv" }, "Solo apps IPTV (CarTV, Kodi) — manda Referer"),
+    el("option", { value: "iptv" }, "Apps IPTV: CarTV, Kodi (recomendado)"),
+    el("option", { value: "both" }, "VLC + apps IPTV (el Referer no llega a CarTV)"),
     el("option", { value: "vlc" }, "Solo VLC"));
   fmt.value = S.settings.format;
   fmt.onchange = () => { S.settings.format = fmt.value; list.dirty = true; save(); };
@@ -781,7 +797,7 @@ function exportSheet(list) {
   drawPub();
   sheet(`Exportar «${list.name}»`, [
     el("label", {}, "Formato"), fmt,
-    el("p", { class: "hint" }, "Si un canal necesita Referer y CarTV no lo abre, elige «Solo apps IPTV»."),
+    el("p", { class: "hint" }, "Para CarTV usa «Apps IPTV»: el Referer va pegado al link, que es como CarTV lo lee."),
     el("label", {}, "Archivo"),
     el("div", { class: "acts" }, el("button", { class: "btn primary", onclick: () => share(".m3u") }, icon("share"), ".m3u"), el("button", { class: "btn", onclick: () => share(".m3u8") }, icon("share"), ".m3u8")),
     el("div", { class: "acts" }, el("button", { class: "btn", onclick: () => download(".m3u") }, icon("download"), ".m3u"), el("button", { class: "btn", onclick: () => download(".m3u8") }, icon("download"), ".m3u8")),
@@ -812,7 +828,7 @@ async function publishList(list, format = S.settings.format) {
 function renderSettings() {
   const tok = el("input", { class: "field", type: "password", placeholder: "ghp_…", value: S.settings.ghToken, autocapitalize: "off", spellcheck: false });
   tok.onchange = () => { S.settings.ghToken = tok.value.trim(); save({ republish: false }); toast(S.settings.ghToken ? "GitHub conectado" : "GitHub desconectado"); };
-  const fmt = el("select", { class: "field" }, el("option", { value: "both" }, "VLC + apps IPTV (recomendado)"), el("option", { value: "iptv" }, "Solo apps IPTV (CarTV, Kodi)"), el("option", { value: "vlc" }, "Solo VLC"));
+  const fmt = el("select", { class: "field" }, el("option", { value: "iptv" }, "Apps IPTV: CarTV, Kodi (recomendado)"), el("option", { value: "both" }, "VLC + apps IPTV (el Referer no llega a CarTV)"), el("option", { value: "vlc" }, "Solo VLC"));
   fmt.value = S.settings.format;
   fmt.onchange = () => { S.settings.format = fmt.value; S.lists.forEach((l) => (l.dirty = true)); save(); };
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
