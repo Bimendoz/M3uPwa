@@ -34,9 +34,9 @@ Safari → abre el link → Compartir (cuadro con flecha) → **Añadir a pantal
   2. Si no (lo más común: el reproductor arma el link en vivo), le pasa el encargo a la **extensión de Chrome
      de tu computador** por tu GitHub. La extensión abre la página, captura el video, lo prueba y responde.
      La app lo vuelve a probar aquí y te dice si también funciona en este equipo.
-- La búsqueda por nombre sigue el mismo recorrido que la extensión, link por link y en orden: directorio → sitio oficial → resultados de la web.
-  Si el directorio no alcanza, la app le pasa sola el encargo a tu computador con tus ajustes (Ajustes → Búsqueda):
-  **parar en el primer link que funcione** y **cuántos resultados de la web revisar** (sin límite). En «Páginas revisadas» ves cada página que abrió.
+- **Links a probar** (Ajustes → Búsqueda, botón Guardar): cada búsqueda prueba exactamente esa cantidad, uno por uno y en orden:
+  directorio (en el iPhone) → sitio oficial → web (con tu computador). No se detiene aunque alguno ya funcione.
+  La extensión tiene el mismo ajuste en su ⚙. En «Páginas revisadas» ves cada página que abrió.
 - Requisitos: el mismo usuario de GitHub en la app (Ajustes) y en la extensión (lista publicada), y el computador
   prendido con Chrome abierto. La extensión revisa encargos cada 30 segundos.
 
